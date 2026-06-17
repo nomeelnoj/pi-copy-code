@@ -168,6 +168,85 @@ function describeBlock(block: CodeBlock): string {
   return `${block.index}. ${block.lang || "text"} (${lines} line${lines === 1 ? "" : "s"}) ${first}`;
 }
 
+export function wrapIndex(index: number, delta: number, count: number): number {
+  if (count <= 0) {
+    return 0;
+  }
+  return ((index + delta) % count + count) % count;
+}
+
+// Case-insensitive subsequence fuzzy score. Returns -1 when the query does not
+// match. Higher scores reward earlier matches and contiguous runs.
+export function fuzzyScore(text: string, query: string): number {
+  if (!query) {
+    return 0;
+  }
+
+  const haystack = text.toLowerCase();
+  const needle = query.toLowerCase();
+
+  let cursor = 0;
+  let score = 0;
+  let streak = 0;
+
+  for (const char of needle) {
+    const found = haystack.indexOf(char, cursor);
+    if (found === -1) {
+      return -1;
+    }
+    if (found === cursor) {
+      streak += 1;
+      score += 5 + streak;
+    } else {
+      streak = 0;
+      score += 1;
+    }
+    score -= Math.min(found, 20) * 0.1;
+    cursor = found + 1;
+  }
+
+  // A matched query never returns the -1 no-match sentinel: the gap penalty
+  // above can otherwise drive a valid (but distant) match below zero.
+  return Math.max(0, score);
+}
+
+// Filters choices by a whitespace-delimited query where every token must match.
+// Empty queries preserve the original order. The aggregate "All code blocks"
+// choice (index 0 with that label) is matched on its label only, so a code
+// search does not always surface it at the top via its concatenated contents.
+export function filterCopyChoices(items: CopyChoice[], query: string): CopyChoice[] {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return items.slice();
+  }
+
+  const tokens = trimmed.split(/\s+/);
+
+  const scored: { item: CopyChoice; score: number; order: number }[] = [];
+  items.forEach((item, order) => {
+    const isAggregate = order === 0 && item.label.startsWith("All code blocks");
+    const haystack = isAggregate ? item.label : `${item.label}\n${item.lang}\n${item.code}`;
+
+    let total = 0;
+    let matched = true;
+    for (const token of tokens) {
+      const score = fuzzyScore(haystack, token);
+      if (score < 0) {
+        matched = false;
+        break;
+      }
+      total += score;
+    }
+
+    if (matched) {
+      scored.push({ item, score: total, order });
+    }
+  });
+
+  scored.sort((a, b) => b.score - a.score || a.order - b.order);
+  return scored.map((entry) => entry.item);
+}
+
 export function createCopyChoices(blocks: CodeBlock[]): CopyChoice[] {
   if (blocks.length <= 1) {
     return blocks.map((block) => ({ label: describeBlock(block), code: block.code, lang: block.lang }));
@@ -179,9 +258,19 @@ export function createCopyChoices(blocks: CodeBlock[]): CopyChoice[] {
   ];
 }
 
+function isBackspace(data: string): boolean {
+  return data === "\x7f" || data === "\b" || matchesKey(data, "backspace");
+}
+
+function isPrintable(data: string): boolean {
+  return data.length === 1 && data >= " " && data !== "\x7f";
+}
+
 class CodeBlockPickerComponent {
   private selected = 0;
   private items: CopyChoice[];
+  private query = "";
+  private searching = false;
 
   constructor(
     blocks: CodeBlock[],
@@ -194,27 +283,70 @@ class CodeBlockPickerComponent {
     this.items = createCopyChoices(blocks);
   }
 
+  private activeQuery(): string {
+    return this.searching ? this.query : "";
+  }
+
+  private visibleItems(): CopyChoice[] {
+    return filterCopyChoices(this.items, this.activeQuery());
+  }
+
+  private exitSearch(): void {
+    this.searching = false;
+    this.query = "";
+    this.selected = 0;
+    this.tui.requestRender();
+  }
+
   render(width: number): string[] {
     const listWidth = Math.min(36, Math.floor(width * 0.38));
     const previewWidth = Math.max(10, width - listWidth - 3);
     const maxHeight = Math.min(28, Math.max(this.items.length + 6, 14));
 
-    const listLines = this.items.map((item, i) => {
-      const prefix = i === this.selected ? "> " : "  ";
-      const text = prefix + item.label;
-      const styled =
-        i === this.selected
-          ? this.theme.fg("accent", text)
-          : this.theme.fg("dim", text);
-      return truncateToWidth(styled, listWidth, undefined, true);
-    });
+    const visibleItems = this.visibleItems();
+    if (this.selected >= visibleItems.length) {
+      this.selected = Math.max(0, visibleItems.length - 1);
+    }
 
-    const selected = this.items[this.selected];
-    const mdText = selected.lang
-      ? `\`\`\`${selected.lang}\n${selected.code}\n\`\`\``
-      : selected.code;
-    const md = new Markdown(mdText, 0, 1, this.mdTheme);
-    const previewLines = md.render(previewWidth).slice(0, maxHeight - 4);
+    const boxRows = maxHeight - 2;
+    const showSearch = this.searching;
+    const searchRows = showSearch ? 1 : 0;
+    const itemRows = Math.max(1, boxRows - searchRows);
+
+    const offset = Math.min(
+      Math.max(0, this.selected - itemRows + 1),
+      Math.max(0, visibleItems.length - itemRows),
+    );
+
+    const leftLines: string[] = [];
+    if (showSearch) {
+      const counter = `${visibleItems.length}/${this.items.length}`;
+      const searchLine = `/${this.query}█  ${counter}`;
+      leftLines.push(truncateToWidth(this.theme.fg("accent", searchLine), listWidth, undefined, true));
+    }
+
+    if (visibleItems.length === 0) {
+      leftLines.push(truncateToWidth(this.theme.fg("dim", "  (no matches)"), listWidth, undefined, true));
+    } else {
+      for (let i = offset; i < Math.min(visibleItems.length, offset + itemRows); i++) {
+        const item = visibleItems[i];
+        const prefix = i === this.selected ? "> " : "  ";
+        const text = prefix + item.label;
+        const styled =
+          i === this.selected ? this.theme.fg("accent", text) : this.theme.fg("dim", text);
+        leftLines.push(truncateToWidth(styled, listWidth, undefined, true));
+      }
+    }
+
+    const selected = visibleItems[this.selected];
+    let previewLines: string[] = [];
+    if (selected) {
+      const mdText = selected.lang
+        ? `\`\`\`${selected.lang}\n${selected.code}\n\`\`\``
+        : selected.code;
+      const md = new Markdown(mdText, 0, 1, this.mdTheme);
+      previewLines = md.render(previewWidth).slice(0, maxHeight - 4);
+    }
 
     const border = (s: string) => this.theme.fg("border", s);
     const divider = border("│");
@@ -228,8 +360,8 @@ class CodeBlockPickerComponent {
         border("┐"),
     );
 
-    for (let i = 0; i < maxHeight - 2; i++) {
-      const left = listLines[i] || " ".repeat(listWidth);
+    for (let i = 0; i < boxRows; i++) {
+      const left = leftLines[i] || " ".repeat(listWidth);
       const right = truncateToWidth(previewLines[i] || "", previewWidth, undefined, true);
       lines.push(divider + left + divider + right + divider);
     }
@@ -243,7 +375,9 @@ class CodeBlockPickerComponent {
     );
 
     const enterLabel = this.enterAction === "edit" ? "enter edit" : "enter copy";
-    const hint = ` ↑↓/j/k navigate • ${enterLabel} • e edit • esc/q cancel `;
+    const hint = this.searching
+      ? ` ↑↓ navigate • ${enterLabel} • ⌫/esc back `
+      : ` ↑↓/j/k navigate • ${enterLabel} • e edit • / search • esc/q cancel `;
     const hintWidth = visibleWidth(hint);
     const pad = Math.max(0, width - hintWidth);
     lines.push(this.theme.fg("dim", " ".repeat(Math.floor(pad / 2)) + hint));
@@ -252,16 +386,60 @@ class CodeBlockPickerComponent {
   }
 
   handleInput(data: string): void {
-    if (matchesKey(data, "up") || data === "k") {
-      this.selected = Math.max(0, this.selected - 1);
+    const visibleItems = this.visibleItems();
+
+    if (this.searching) {
+      if (matchesKey(data, "escape")) {
+        this.exitSearch();
+      } else if (isBackspace(data)) {
+        // Deleting past an empty query leaves search, like esc.
+        if (this.query.length === 0) {
+          this.exitSearch();
+        } else {
+          this.query = this.query.slice(0, -1);
+          this.selected = 0;
+          this.tui.requestRender();
+        }
+      } else if (matchesKey(data, "enter")) {
+        const item = visibleItems[this.selected];
+        if (item) {
+          this.done({ action: this.enterAction, code: item.code });
+        }
+      } else if (matchesKey(data, "up")) {
+        this.selected = wrapIndex(this.selected, -1, visibleItems.length);
+        this.tui.requestRender();
+      } else if (matchesKey(data, "down")) {
+        this.selected = wrapIndex(this.selected, 1, visibleItems.length);
+        this.tui.requestRender();
+      } else if (isPrintable(data)) {
+        this.query += data;
+        this.selected = 0;
+        this.tui.requestRender();
+      }
+      return;
+    }
+
+    if (data === "/") {
+      this.searching = true;
+      this.query = "";
+      this.selected = 0;
+      this.tui.requestRender();
+    } else if (matchesKey(data, "up") || data === "k") {
+      this.selected = wrapIndex(this.selected, -1, visibleItems.length);
       this.tui.requestRender();
     } else if (matchesKey(data, "down") || data === "j") {
-      this.selected = Math.min(this.items.length - 1, this.selected + 1);
+      this.selected = wrapIndex(this.selected, 1, visibleItems.length);
       this.tui.requestRender();
     } else if (matchesKey(data, "enter")) {
-      this.done({ action: this.enterAction, code: this.items[this.selected].code });
+      const item = visibleItems[this.selected];
+      if (item) {
+        this.done({ action: this.enterAction, code: item.code });
+      }
     } else if (data === "e") {
-      this.done({ action: "edit", code: this.items[this.selected].code });
+      const item = visibleItems[this.selected];
+      if (item) {
+        this.done({ action: "edit", code: item.code });
+      }
     } else if (matchesKey(data, "escape") || data === "q") {
       this.done(undefined);
     }
