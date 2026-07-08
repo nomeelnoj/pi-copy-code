@@ -27,6 +27,17 @@ export type CopyChoice = {
   lang: string;
 };
 
+export type MessageBlocks = {
+  // 1-based chronological label among the collected messages (oldest = 1,
+  // newest = messages.length).
+  ordinal: number;
+  blocks: CodeBlock[];
+};
+
+// Cap on how many prior assistant messages (that contain code) the picker will
+// surface. Bounds in-memory work; nothing here is ever sent to the model.
+export const DEFAULT_MESSAGE_CAP = 10;
+
 type CopyAction = "copy" | "edit";
 
 type PickerResult = {
@@ -34,31 +45,54 @@ type PickerResult = {
   code: string;
 } | undefined;
 
-function latestAssistantMarkdown(ctx: AnyContext): string | undefined {
+function resolveEntries(ctx: AnyContext): any[] {
   const sessionManager = ctx.sessionManager as any;
   const entries =
     typeof sessionManager.getBranch === "function"
       ? sessionManager.getBranch()
       : sessionManager.getEntries();
+  return Array.isArray(entries) ? entries : [];
+}
 
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    const message = entry?.type === "message" ? entry.message : undefined;
-    if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+function assistantMessageText(entry: any): string {
+  const message = entry?.type === "message" ? entry.message : undefined;
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return "";
+  }
+
+  return message.content
+    .filter((content: any) => content?.type === "text" && typeof content.text === "string")
+    .map((content: any) => content.text)
+    .join("\n");
+}
+
+// Pure helper: given raw session entries (chronological, oldest first), return
+// the last `cap` assistant messages that contain code blocks. Messages without
+// code blocks are skipped entirely. Ordinals are assigned chronologically after
+// the cap is applied, so the newest surfaced message is `result.at(-1)`.
+export function extractMessageBlocks(entries: any[], cap = DEFAULT_MESSAGE_CAP): MessageBlocks[] {
+  const collected: CodeBlock[][] = [];
+
+  for (const entry of entries) {
+    const text = assistantMessageText(entry);
+    if (!text.trim()) {
       continue;
     }
 
-    const text = message.content
-      .filter((content: any) => content?.type === "text" && typeof content.text === "string")
-      .map((content: any) => content.text)
-      .join("\n");
-
-    if (text.trim()) {
-      return text;
+    const blocks = extractCodeBlocks(text);
+    if (blocks.length === 0) {
+      continue;
     }
+
+    collected.push(blocks);
   }
 
-  return undefined;
+  const tail = cap > 0 ? collected.slice(-cap) : collected.slice();
+  return tail.map((blocks, i) => ({ ordinal: i + 1, blocks }));
+}
+
+function collectAssistantCodeBlocks(ctx: AnyContext, cap = DEFAULT_MESSAGE_CAP): MessageBlocks[] {
+  return extractMessageBlocks(resolveEntries(ctx), cap);
 }
 
 export function extractCodeBlocks(markdown: string): CodeBlock[] {
@@ -268,27 +302,47 @@ function isPrintable(data: string): boolean {
 
 class CodeBlockPickerComponent {
   private selected = 0;
-  private items: CopyChoice[];
+  private messageIndex: number;
+  private readonly choicesByMessage: CopyChoice[][];
+  private readonly maxChoices: number;
   private query = "";
   private searching = false;
 
   constructor(
-    blocks: CodeBlock[],
+    private messages: MessageBlocks[],
     private theme: Theme,
     private mdTheme: MarkdownTheme,
     private tui: TUI,
     private enterAction: CopyAction,
     private done: (result: PickerResult) => void,
   ) {
-    this.items = createCopyChoices(blocks);
+    this.choicesByMessage = messages.map((message) => createCopyChoices(message.blocks));
+    this.maxChoices = this.choicesByMessage.reduce((max, choices) => Math.max(max, choices.length), 1);
+    // Start on the newest message, matching the previous "latest message" behavior.
+    this.messageIndex = Math.max(0, messages.length - 1);
   }
 
   private activeQuery(): string {
     return this.searching ? this.query : "";
   }
 
+  private currentChoices(): CopyChoice[] {
+    return this.choicesByMessage[this.messageIndex] ?? [];
+  }
+
   private visibleItems(): CopyChoice[] {
-    return filterCopyChoices(this.items, this.activeQuery());
+    return filterCopyChoices(this.currentChoices(), this.activeQuery());
+  }
+
+  private switchMessage(delta: number): void {
+    if (this.messages.length <= 1) {
+      return;
+    }
+    this.messageIndex = wrapIndex(this.messageIndex, delta, this.messages.length);
+    this.selected = 0;
+    this.searching = false;
+    this.query = "";
+    this.tui.requestRender();
   }
 
   private exitSearch(): void {
@@ -301,7 +355,7 @@ class CodeBlockPickerComponent {
   render(width: number): string[] {
     const listWidth = Math.min(36, Math.floor(width * 0.38));
     const previewWidth = Math.max(10, width - listWidth - 3);
-    const maxHeight = Math.min(28, Math.max(this.items.length + 6, 14));
+    const maxHeight = Math.min(28, Math.max(this.maxChoices + 6, 14));
 
     const visibleItems = this.visibleItems();
     if (this.selected >= visibleItems.length) {
@@ -310,8 +364,10 @@ class CodeBlockPickerComponent {
 
     const boxRows = maxHeight - 2;
     const showSearch = this.searching;
+    const showHeader = !this.searching && this.messages.length > 1;
     const searchRows = showSearch ? 1 : 0;
-    const itemRows = Math.max(1, boxRows - searchRows);
+    const headerRows = showHeader ? 1 : 0;
+    const itemRows = Math.max(1, boxRows - searchRows - headerRows);
 
     const offset = Math.min(
       Math.max(0, this.selected - itemRows + 1),
@@ -320,9 +376,14 @@ class CodeBlockPickerComponent {
 
     const leftLines: string[] = [];
     if (showSearch) {
-      const counter = `${visibleItems.length}/${this.items.length}`;
+      const counter = `${visibleItems.length}/${this.currentChoices().length}`;
       const searchLine = `/${this.query}█  ${counter}`;
       leftLines.push(truncateToWidth(this.theme.fg("accent", searchLine), listWidth, undefined, true));
+    }
+    if (showHeader) {
+      const current = this.messages[this.messageIndex];
+      const headerLine = `Response ${current.ordinal}/${this.messages.length}`;
+      leftLines.push(truncateToWidth(this.theme.fg("accent", headerLine), listWidth, undefined, true));
     }
 
     if (visibleItems.length === 0) {
@@ -375,9 +436,10 @@ class CodeBlockPickerComponent {
     );
 
     const enterLabel = this.enterAction === "edit" ? "enter edit" : "enter copy";
+    const msgSegment = this.messages.length > 1 ? "←/→/tab msg • " : "";
     const hint = this.searching
       ? ` ↑↓ navigate • ${enterLabel} • ⌫/esc back `
-      : ` ↑↓/j/k navigate • ${enterLabel} • e edit • / search • esc/q cancel `;
+      : ` ${msgSegment}↑↓/j/k block • ${enterLabel} • e edit • / search • esc/q cancel `;
     const hintWidth = visibleWidth(hint);
     const pad = Math.max(0, width - hintWidth);
     lines.push(this.theme.fg("dim", " ".repeat(Math.floor(pad / 2)) + hint));
@@ -424,6 +486,10 @@ class CodeBlockPickerComponent {
       this.query = "";
       this.selected = 0;
       this.tui.requestRender();
+    } else if (matchesKey(data, "left") || matchesKey(data, "shift+tab")) {
+      this.switchMessage(-1);
+    } else if (matchesKey(data, "right") || matchesKey(data, "tab")) {
+      this.switchMessage(1);
     } else if (matchesKey(data, "up") || data === "k") {
       this.selected = wrapIndex(this.selected, -1, visibleItems.length);
       this.tui.requestRender();
@@ -449,19 +515,21 @@ class CodeBlockPickerComponent {
 }
 
 async function chooseCopyAction(
-  blocks: CodeBlock[],
+  messages: MessageBlocks[],
   ctx: AnyContext,
   enterAction: CopyAction,
 ): Promise<PickerResult> {
-  if (blocks.length === 1) {
-    return { action: enterAction, code: blocks[0].code };
+  // Only shortcut past the picker when there is a single block in a single
+  // message; otherwise the picker is needed to navigate messages or blocks.
+  if (messages.length === 1 && messages[0].blocks.length === 1) {
+    return { action: enterAction, code: messages[0].blocks[0].code };
   }
 
   const mdTheme = { ...getMarkdownTheme(), codeBlockIndent: "" };
 
   return await ctx.ui.custom<PickerResult>(
     (tui, theme, _keybindings, done) =>
-      new CodeBlockPickerComponent(blocks, theme, mdTheme, tui, enterAction, done),
+      new CodeBlockPickerComponent(messages, theme, mdTheme, tui, enterAction, done),
     { overlay: true },
   );
 }
@@ -598,15 +666,9 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
       await ctx.waitForIdle();
     }
 
-    const markdown = latestAssistantMarkdown(ctx);
-    if (!markdown) {
-      ctx.ui.notify("No assistant message found", "warning");
-      return;
-    }
-
-    const blocks = extractCodeBlocks(markdown);
-    if (blocks.length === 0) {
-      ctx.ui.notify("No code blocks found in the last assistant message", "warning");
+    const messages = collectAssistantCodeBlocks(ctx, DEFAULT_MESSAGE_CAP);
+    if (messages.length === 0) {
+      ctx.ui.notify("No code blocks found in recent assistant messages", "warning");
       return;
     }
 
@@ -614,7 +676,7 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
     let text: string | undefined;
 
     if (!arg || arg === "edit") {
-      const result = await chooseCopyAction(blocks, ctx, arg === "edit" ? "edit" : "copy");
+      const result = await chooseCopyAction(messages, ctx, arg === "edit" ? "edit" : "copy");
       if (result === undefined) {
         ctx.ui.notify("Copy cancelled", "info");
         return;
