@@ -93,7 +93,8 @@ Edit before copying:
 When multiple blocks or messages are available, the picker opens:
 
 - `↑` / `↓` or `j` / `k` — move block selection within the current response
-- `←` / `→`, or `tab` / `shift+tab` — move across the response tabs (only when more than one response has code)
+- `→` or `tab` — walk back through older responses; `←` or `shift+tab` — walk toward the current response (only when
+  more than one response has code; wraps around at the ends)
 - `enter` — run the default action
   - `/copy-code`: copy
   - `/copy-code edit`: edit, then copy
@@ -104,13 +105,13 @@ When multiple blocks or messages are available, the picker opens:
 When more than one recent response has code, a horizontal tab strip runs across the top of the picker:
 
 ```text
-‹ Response 2 │ Response 1 │ Response 0 ›
+Current │ Prev 1 │ Prev 2 │ Prev 3 ›
 ```
 
-Each tab is a prior assistant response, newest labeled `Response 0` on the right and older responses increasing to the
-left. Arrow across with `←` / `→` (or `tab` / `shift+tab`). The picker starts on the newest response. The strip scrolls
-horizontally so the box keeps a fixed size even with the full 10 responses; `‹` / `›` mark responses scrolled off
-screen.
+The newest response is `Current` on the left; older responses count back as `Prev 1`, `Prev 2`, … to the right. The
+picker starts on `Current`. Press `→` (or `tab`) to walk back through older responses and `←` (or `shift+tab`) to come
+back toward `Current`; arrowing past either end wraps around. The strip scrolls horizontally so the box keeps a fixed
+size even with the full 10 responses; `‹` / `›` mark responses scrolled off screen.
 
 The first picker item is `All code blocks`, which copies all blocks in the current response separated by blank lines.
 
