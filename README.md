@@ -8,15 +8,17 @@ padding.
 - `/copy-code`
 - `ctrl+alt+c`
 
-It reads the latest assistant message, extracts fenced code blocks, and copies the raw code text to your clipboard. If
-there is more than one block, it opens a small two-pane picker with a live preview.
+It reads recent assistant messages, extracts fenced code blocks, and copies the raw code text to your clipboard. If
+there is more than one block (or more than one recent message with code), it opens a small two-pane picker with a live
+preview. From the picker you can page back through prior responses without leaving the overlay.
 
 ## Features
 
 - Copy raw fenced code instead of rendered terminal cells.
 - Preserve whitespace-sensitive YAML, shell, Python, and heredoc indentation.
-- Copy one block immediately when there is only one block.
+- Copy one block immediately when there is only one block in one message.
 - Choose between multiple blocks with a preview picker.
+- Page back through the last 10 assistant responses that contain code, right from the picker.
 - Copy all blocks at once from the picker.
 - Edit a selected block in your external editor before copying.
 - Clipboard fallback order:
@@ -88,16 +90,22 @@ Edit before copying:
 /copy-code edit
 ```
 
-When multiple blocks are available, the picker opens:
+When multiple blocks or messages are available, the picker opens:
 
-- `↑` / `↓` or `j` / `k` — move selection
+- `↑` / `↓` or `j` / `k` — move block selection within the current response
+- `←` / `→`, or `tab` / `shift+tab` — switch between assistant responses (only when more than one has code)
 - `enter` — run the default action
   - `/copy-code`: copy
   - `/copy-code edit`: edit, then copy
 - `e` — edit selected block, then copy
+- `/` — fuzzy search blocks in the current response
 - `esc` or `q` — cancel
 
-The first picker item is `All code blocks`, which copies all blocks separated by blank lines.
+The picker starts on the newest response. A `Response N/M` header shows which response you are viewing (newest is `M`).
+The first picker item is `All code blocks`, which copies all blocks in the current response separated by blank lines.
+
+Only the last 10 assistant responses that contain code blocks are surfaced. This bound keeps the picker responsive and
+never sends anything to the model — it only reads session data already in memory.
 
 ## External editor setup
 
@@ -115,7 +123,7 @@ If neither variable is set, `/copy-code edit` shows a warning and cancels.
 
 ## What counts as a code block?
 
-`pi-copy-code` extracts fenced markdown blocks from the latest assistant message:
+`pi-copy-code` extracts fenced markdown blocks from recent assistant messages:
 
 ````markdown
 ```bash
