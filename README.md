@@ -93,7 +93,7 @@ Edit before copying:
 When multiple blocks or messages are available, the picker opens:
 
 - `↑` / `↓` or `j` / `k` — move block selection within the current response
-- `←` / `→`, or `tab` / `shift+tab` — switch between assistant responses (only when more than one has code)
+- `←` / `→`, or `tab` / `shift+tab` — move across the response tabs (only when more than one response has code)
 - `enter` — run the default action
   - `/copy-code`: copy
   - `/copy-code edit`: edit, then copy
@@ -101,7 +101,17 @@ When multiple blocks or messages are available, the picker opens:
 - `/` — fuzzy search blocks in the current response
 - `esc` or `q` — cancel
 
-The picker starts on the newest response. A `Response N/M` header shows which response you are viewing (newest is `M`).
+When more than one recent response has code, a horizontal tab strip runs across the top of the picker:
+
+```text
+‹ Response 2 │ Response 1 │ Response 0 ›
+```
+
+Each tab is a prior assistant response, newest labeled `Response 0` on the right and older responses increasing to the
+left. Arrow across with `←` / `→` (or `tab` / `shift+tab`). The picker starts on the newest response. The strip scrolls
+horizontally so the box keeps a fixed size even with the full 10 responses; `‹` / `›` mark responses scrolled off
+screen.
+
 The first picker item is `All code blocks`, which copies all blocks in the current response separated by blank lines.
 
 Only the last 10 assistant responses that contain code blocks are surfaced. This bound keeps the picker responsive and
