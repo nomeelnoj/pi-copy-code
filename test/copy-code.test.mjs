@@ -167,6 +167,43 @@ test("extractMessageBlocks tolerates non-array and empty input", () => {
   assert.deepEqual(extension.extractMessageBlocks([userEntry("hi")]), []);
 });
 
+test("responseTabLabels label newest as Response 0, oldest highest", () => {
+  assert.deepEqual(extension.responseTabLabels(1), ["Response 0"]);
+  assert.deepEqual(extension.responseTabLabels(3), [
+    "Response 2",
+    "Response 1",
+    "Response 0",
+  ]);
+});
+
+test("tabWindow shows every tab when they all fit", () => {
+  const win = extension.tabWindow([10, 10, 10], 2, 100);
+  assert.deepEqual(win, { start: 0, end: 3, leftMore: false, rightMore: false });
+});
+
+test("tabWindow keeps the active tail tab visible and scrolls older ones off", () => {
+  // 6 tabs of width 12 (+ separators) cannot fit in 30 cols; active is newest (5).
+  const widths = Array.from({ length: 6 }, () => 12);
+  const win = extension.tabWindow(widths, 5, 30);
+
+  assert.ok(win.start <= 5 && win.end === 6, "active tail tab stays in window");
+  assert.equal(win.leftMore, true, "older tabs are off-screen to the left");
+  assert.equal(win.rightMore, false, "newest is already the rightmost");
+});
+
+test("tabWindow keeps a mid-list active tab within the window", () => {
+  const widths = Array.from({ length: 8 }, () => 12);
+  const win = extension.tabWindow(widths, 3, 30);
+
+  assert.ok(win.start <= 3 && 3 < win.end, "active index is inside [start, end)");
+  assert.ok(win.end - win.start >= 1);
+});
+
+test("tabWindow handles a single tab", () => {
+  const win = extension.tabWindow([12], 0, 30);
+  assert.deepEqual(win, { start: 0, end: 1, leftMore: false, rightMore: false });
+});
+
 test("splitEditorCommand preserves quoted editor commands", () => {
   assert.deepEqual(extension.splitEditorCommand('"/Applications/MacVim.app/Contents/bin/mvim" --wait'), [
     "/Applications/MacVim.app/Contents/bin/mvim",

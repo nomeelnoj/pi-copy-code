@@ -209,6 +209,61 @@ export function wrapIndex(index: number, delta: number, count: number): number {
   return ((index + delta) % count + count) % count;
 }
 
+// Recency labels for the response tab strip. Messages are stored chronologically
+// (oldest first), so the newest message is labeled "Response 0" and older ones
+// increment. Displayed oldest→newest left-to-right, newest "Response 0" sits
+// rightmost, matching the internal messageIndex ordering.
+export function responseTabLabels(count: number): string[] {
+  return Array.from({ length: count }, (_, i) => `Response ${count - 1 - i}`);
+}
+
+// Pure horizontal-scroll window for the tab strip. Given each tab cell's visible
+// width, the active tab index, and the available width, returns the [start, end)
+// index window that fits, always including activeIndex. A single-column marker is
+// reserved on each side when there are more tabs off-screen. Separators between
+// adjacent tabs are 1 column and accounted for internally. Expansion prefers the
+// newer (right) neighbors first so context leans toward the latest response.
+export function tabWindow(
+  cellWidths: number[],
+  activeIndex: number,
+  width: number,
+): { start: number; end: number; leftMore: boolean; rightMore: boolean } {
+  const n = cellWidths.length;
+  if (n === 0) {
+    return { start: 0, end: 0, leftMore: false, rightMore: false };
+  }
+
+  const sep = 1;
+  const totalAll = cellWidths.reduce((sum, w) => sum + w, 0) + (n - 1) * sep;
+  if (totalAll <= width) {
+    return { start: 0, end: n, leftMore: false, rightMore: false };
+  }
+
+  // Reserve up to one column per side for the ‹ / › markers while scrolling.
+  const budget = Math.max(1, width - 2);
+  const active = Math.min(Math.max(0, activeIndex), n - 1);
+
+  let start = active;
+  let end = active + 1; // [start, end)
+  let used = cellWidths[active];
+  let grow = true;
+  while (grow) {
+    grow = false;
+    if (end < n && used + sep + cellWidths[end] <= budget) {
+      used += sep + cellWidths[end];
+      end += 1;
+      grow = true;
+    }
+    if (start - 1 >= 0 && used + sep + cellWidths[start - 1] <= budget) {
+      used += sep + cellWidths[start - 1];
+      start -= 1;
+      grow = true;
+    }
+  }
+
+  return { start, end, leftMore: start > 0, rightMore: end < n };
+}
+
 // Case-insensitive subsequence fuzzy score. Returns -1 when the query does not
 // match. Higher scores reward earlier matches and contiguous runs.
 export function fuzzyScore(text: string, query: string): number {
@@ -352,6 +407,48 @@ class CodeBlockPickerComponent {
     this.tui.requestRender();
   }
 
+  // Builds the full-width response tab strip, scrolled so the active tab is
+  // always visible. Returns exactly `innerWidth` visible columns of content
+  // (styled), without the surrounding box borders.
+  private renderTabStrip(innerWidth: number): string {
+    const labels = responseTabLabels(this.messages.length);
+    const cells = labels.map((label) => ` ${label} `);
+    const cellWidths = cells.map((cell) => visibleWidth(cell));
+    const win = tabWindow(cellWidths, this.messageIndex, innerWidth);
+    const scrolling = win.leftMore || win.rightMore;
+
+    const border = (s: string) => this.theme.fg("border", s);
+    let out = "";
+    let vis = 0;
+
+    if (scrolling) {
+      out += win.leftMore ? this.theme.fg("accent", "‹") : " ";
+      vis += 1;
+    }
+
+    for (let i = win.start; i < win.end; i++) {
+      if (i > win.start) {
+        out += border("│");
+        vis += 1;
+      }
+      out +=
+        i === this.messageIndex
+          ? this.theme.fg("accent", cells[i])
+          : this.theme.fg("dim", cells[i]);
+      vis += cellWidths[i];
+    }
+
+    if (scrolling) {
+      const rightMarker = win.rightMore ? this.theme.fg("accent", "›") : " ";
+      const pad = Math.max(0, innerWidth - vis - 1);
+      out += " ".repeat(pad) + rightMarker;
+    } else {
+      out += " ".repeat(Math.max(0, innerWidth - vis));
+    }
+
+    return out;
+  }
+
   render(width: number): string[] {
     const listWidth = Math.min(36, Math.floor(width * 0.38));
     const previewWidth = Math.max(10, width - listWidth - 3);
@@ -362,12 +459,12 @@ class CodeBlockPickerComponent {
       this.selected = Math.max(0, visibleItems.length - 1);
     }
 
+    const innerWidth = listWidth + previewWidth + 1;
     const boxRows = maxHeight - 2;
     const showSearch = this.searching;
-    const showHeader = !this.searching && this.messages.length > 1;
+    const showStrip = this.messages.length > 1;
     const searchRows = showSearch ? 1 : 0;
-    const headerRows = showHeader ? 1 : 0;
-    const itemRows = Math.max(1, boxRows - searchRows - headerRows);
+    const itemRows = Math.max(1, boxRows - searchRows);
 
     const offset = Math.min(
       Math.max(0, this.selected - itemRows + 1),
@@ -380,12 +477,6 @@ class CodeBlockPickerComponent {
       const searchLine = `/${this.query}█  ${counter}`;
       leftLines.push(truncateToWidth(this.theme.fg("accent", searchLine), listWidth, undefined, true));
     }
-    if (showHeader) {
-      const current = this.messages[this.messageIndex];
-      const headerLine = `Response ${current.ordinal}/${this.messages.length}`;
-      leftLines.push(truncateToWidth(this.theme.fg("accent", headerLine), listWidth, undefined, true));
-    }
-
     if (visibleItems.length === 0) {
       leftLines.push(truncateToWidth(this.theme.fg("dim", "  (no matches)"), listWidth, undefined, true));
     } else {
@@ -413,13 +504,25 @@ class CodeBlockPickerComponent {
     const divider = border("│");
     const lines: string[] = [];
 
-    lines.push(
-      border("┌") +
-        border("─".repeat(listWidth)) +
-        border("┬") +
-        border("─".repeat(previewWidth)) +
-        border("┐"),
-    );
+    if (showStrip) {
+      lines.push(border("┌") + border("─".repeat(innerWidth)) + border("┐"));
+      lines.push(divider + this.renderTabStrip(innerWidth) + divider);
+      lines.push(
+        border("├") +
+          border("─".repeat(listWidth)) +
+          border("┬") +
+          border("─".repeat(previewWidth)) +
+          border("┤"),
+      );
+    } else {
+      lines.push(
+        border("┌") +
+          border("─".repeat(listWidth)) +
+          border("┬") +
+          border("─".repeat(previewWidth)) +
+          border("┐"),
+      );
+    }
 
     for (let i = 0; i < boxRows; i++) {
       const left = leftLines[i] || " ".repeat(listWidth);
@@ -436,10 +539,10 @@ class CodeBlockPickerComponent {
     );
 
     const enterLabel = this.enterAction === "edit" ? "enter edit" : "enter copy";
-    const msgSegment = this.messages.length > 1 ? "←/→/tab msg • " : "";
+    const msgSegment = this.messages.length > 1 ? "←/→ responses • " : "";
     const hint = this.searching
       ? ` ↑↓ navigate • ${enterLabel} • ⌫/esc back `
-      : ` ${msgSegment}↑↓/j/k block • ${enterLabel} • e edit • / search • esc/q cancel `;
+      : ` ${msgSegment}↑↓/j/k blocks • ${enterLabel} • e edit • / search • esc/q cancel `;
     const hintWidth = visibleWidth(hint);
     const pad = Math.max(0, width - hintWidth);
     lines.push(this.theme.fg("dim", " ".repeat(Math.floor(pad / 2)) + hint));
