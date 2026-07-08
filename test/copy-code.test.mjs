@@ -167,13 +167,9 @@ test("extractMessageBlocks tolerates non-array and empty input", () => {
   assert.deepEqual(extension.extractMessageBlocks([userEntry("hi")]), []);
 });
 
-test("responseTabLabels label newest as Response 0, oldest highest", () => {
-  assert.deepEqual(extension.responseTabLabels(1), ["Response 0"]);
-  assert.deepEqual(extension.responseTabLabels(3), [
-    "Response 2",
-    "Response 1",
-    "Response 0",
-  ]);
+test("responseTabLabels label newest as Current, older as Prev N (display order)", () => {
+  assert.deepEqual(extension.responseTabLabels(1), ["Current"]);
+  assert.deepEqual(extension.responseTabLabels(3), ["Current", "Prev 1", "Prev 2"]);
 });
 
 test("tabWindow shows every tab when they all fit", () => {

@@ -209,12 +209,12 @@ export function wrapIndex(index: number, delta: number, count: number): number {
   return ((index + delta) % count + count) % count;
 }
 
-// Recency labels for the response tab strip. Messages are stored chronologically
-// (oldest first), so the newest message is labeled "Response 0" and older ones
-// increment. Displayed oldest→newest left-to-right, newest "Response 0" sits
-// rightmost, matching the internal messageIndex ordering.
+// Display-order labels for the response tab strip, laid out left-to-right with
+// the newest response first. The current (newest) response is "Current" and
+// older responses count how many steps back they are ("Prev 1", "Prev 2", ...).
+// Index 0 is the leftmost (current) tab.
 export function responseTabLabels(count: number): string[] {
-  return Array.from({ length: count }, (_, i) => `Response ${count - 1 - i}`);
+  return Array.from({ length: count }, (_, i) => (i === 0 ? "Current" : `Prev ${i}`));
 }
 
 // Pure horizontal-scroll window for the tab strip. Given each tab cell's visible
@@ -411,10 +411,15 @@ class CodeBlockPickerComponent {
   // always visible. Returns exactly `innerWidth` visible columns of content
   // (styled), without the surrounding box borders.
   private renderTabStrip(innerWidth: number): string {
-    const labels = responseTabLabels(this.messages.length);
+    const count = this.messages.length;
+    // Messages are stored chronologically (index 0 oldest, tail newest), but the
+    // strip is displayed newest-first, so map the active message to its display
+    // slot: display 0 = current (newest) = leftmost.
+    const activeDisplay = count - 1 - this.messageIndex;
+    const labels = responseTabLabels(count);
     const cells = labels.map((label) => ` ${label} `);
     const cellWidths = cells.map((cell) => visibleWidth(cell));
-    const win = tabWindow(cellWidths, this.messageIndex, innerWidth);
+    const win = tabWindow(cellWidths, activeDisplay, innerWidth);
     const scrolling = win.leftMore || win.rightMore;
 
     const border = (s: string) => this.theme.fg("border", s);
@@ -432,7 +437,7 @@ class CodeBlockPickerComponent {
         vis += 1;
       }
       out +=
-        i === this.messageIndex
+        i === activeDisplay
           ? this.theme.fg("accent", cells[i])
           : this.theme.fg("dim", cells[i]);
       vis += cellWidths[i];
@@ -590,9 +595,11 @@ class CodeBlockPickerComponent {
       this.selected = 0;
       this.tui.requestRender();
     } else if (matchesKey(data, "left") || matchesKey(data, "shift+tab")) {
-      this.switchMessage(-1);
-    } else if (matchesKey(data, "right") || matchesKey(data, "tab")) {
+      // Left / shift+tab move toward the current (newest) response.
       this.switchMessage(1);
+    } else if (matchesKey(data, "right") || matchesKey(data, "tab")) {
+      // Right / tab walk back through older responses.
+      this.switchMessage(-1);
     } else if (matchesKey(data, "up") || data === "k") {
       this.selected = wrapIndex(this.selected, -1, visibleItems.length);
       this.tui.requestRender();
