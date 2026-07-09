@@ -818,12 +818,13 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("copy-code", {
-    description: "Copy code from the latest assistant message; prompts when multiple blocks",
+    description:
+      "Copy code from recent assistant messages; opens a picker to choose blocks and page across responses",
     handler: run,
   });
 
   pi.registerShortcut("ctrl+alt+c", {
-    description: "Copy code from the latest assistant message",
+    description: "Copy code from recent assistant messages",
     handler: (ctx) => run("", ctx),
   });
 }
