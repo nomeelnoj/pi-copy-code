@@ -111,6 +111,95 @@ test("filterCopyChoices does not let the aggregate option steal code searches", 
   assert.match(filtered[0].label, /^2\. python/);
 });
 
+function assistantEntry(text) {
+  return { type: "message", message: { role: "assistant", content: [{ type: "text", text }] } };
+}
+
+function userEntry(text) {
+  return { type: "message", message: { role: "user", content: [{ type: "text", text }] } };
+}
+
+test("extractMessageBlocks returns chronological ordinals for code messages", () => {
+  const entries = [
+    assistantEntry("first\n```bash\necho one\n```"),
+    userEntry("a question"),
+    assistantEntry("second\n```python\nprint('two')\n```"),
+  ];
+
+  const messages = extension.extractMessageBlocks(entries);
+
+  assert.equal(messages.length, 2);
+  assert.deepEqual(messages.map((m) => m.ordinal), [1, 2]);
+  assert.equal(messages[0].blocks[0].code, "echo one");
+  // Newest surfaced message is last.
+  assert.equal(messages.at(-1).blocks[0].code, "print('two')");
+});
+
+test("extractMessageBlocks skips assistant messages without code blocks", () => {
+  const entries = [
+    assistantEntry("just prose, no fences"),
+    assistantEntry("```bash\necho hi\n```"),
+  ];
+
+  const messages = extension.extractMessageBlocks(entries);
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].ordinal, 1);
+  assert.equal(messages[0].blocks[0].code, "echo hi");
+});
+
+test("extractMessageBlocks caps at the most recent messages and relabels ordinals", () => {
+  const entries = Array.from({ length: 15 }, (_, i) =>
+    assistantEntry(`msg ${i}\n\`\`\`bash\necho ${i}\n\`\`\``),
+  );
+
+  const messages = extension.extractMessageBlocks(entries, 10);
+
+  assert.equal(messages.length, 10);
+  // Ordinals restart at 1 after the cap slice; newest message wins the last slot.
+  assert.deepEqual(messages.map((m) => m.ordinal), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.equal(messages[0].blocks[0].code, "echo 5");
+  assert.equal(messages.at(-1).blocks[0].code, "echo 14");
+});
+
+test("extractMessageBlocks tolerates non-array and empty input", () => {
+  assert.deepEqual(extension.extractMessageBlocks([]), []);
+  assert.deepEqual(extension.extractMessageBlocks([userEntry("hi")]), []);
+});
+
+test("responseTabLabels label newest as Current, older as Prev N (display order)", () => {
+  assert.deepEqual(extension.responseTabLabels(1), ["Current"]);
+  assert.deepEqual(extension.responseTabLabels(3), ["Current", "Prev 1", "Prev 2"]);
+});
+
+test("tabWindow shows every tab when they all fit", () => {
+  const win = extension.tabWindow([10, 10, 10], 2, 100);
+  assert.deepEqual(win, { start: 0, end: 3, leftMore: false, rightMore: false });
+});
+
+test("tabWindow keeps the active tail tab visible and scrolls older ones off", () => {
+  // 6 tabs of width 12 (+ separators) cannot fit in 30 cols; active is newest (5).
+  const widths = Array.from({ length: 6 }, () => 12);
+  const win = extension.tabWindow(widths, 5, 30);
+
+  assert.ok(win.start <= 5 && win.end === 6, "active tail tab stays in window");
+  assert.equal(win.leftMore, true, "older tabs are off-screen to the left");
+  assert.equal(win.rightMore, false, "newest is already the rightmost");
+});
+
+test("tabWindow keeps a mid-list active tab within the window", () => {
+  const widths = Array.from({ length: 8 }, () => 12);
+  const win = extension.tabWindow(widths, 3, 30);
+
+  assert.ok(win.start <= 3 && 3 < win.end, "active index is inside [start, end)");
+  assert.ok(win.end - win.start >= 1);
+});
+
+test("tabWindow handles a single tab", () => {
+  const win = extension.tabWindow([12], 0, 30);
+  assert.deepEqual(win, { start: 0, end: 1, leftMore: false, rightMore: false });
+});
+
 test("splitEditorCommand preserves quoted editor commands", () => {
   assert.deepEqual(extension.splitEditorCommand('"/Applications/MacVim.app/Contents/bin/mvim" --wait'), [
     "/Applications/MacVim.app/Contents/bin/mvim",

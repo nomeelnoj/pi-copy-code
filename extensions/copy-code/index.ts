@@ -27,6 +27,17 @@ export type CopyChoice = {
   lang: string;
 };
 
+export type MessageBlocks = {
+  // 1-based chronological label among the collected messages (oldest = 1,
+  // newest = messages.length).
+  ordinal: number;
+  blocks: CodeBlock[];
+};
+
+// Cap on how many prior assistant messages (that contain code) the picker will
+// surface. Bounds in-memory work; nothing here is ever sent to the model.
+export const DEFAULT_MESSAGE_CAP = 10;
+
 type CopyAction = "copy" | "edit";
 
 type PickerResult = {
@@ -34,31 +45,54 @@ type PickerResult = {
   code: string;
 } | undefined;
 
-function latestAssistantMarkdown(ctx: AnyContext): string | undefined {
+function resolveEntries(ctx: AnyContext): any[] {
   const sessionManager = ctx.sessionManager as any;
   const entries =
     typeof sessionManager.getBranch === "function"
       ? sessionManager.getBranch()
       : sessionManager.getEntries();
+  return Array.isArray(entries) ? entries : [];
+}
 
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    const message = entry?.type === "message" ? entry.message : undefined;
-    if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+function assistantMessageText(entry: any): string {
+  const message = entry?.type === "message" ? entry.message : undefined;
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return "";
+  }
+
+  return message.content
+    .filter((content: any) => content?.type === "text" && typeof content.text === "string")
+    .map((content: any) => content.text)
+    .join("\n");
+}
+
+// Pure helper: given raw session entries (chronological, oldest first), return
+// the last `cap` assistant messages that contain code blocks. Messages without
+// code blocks are skipped entirely. Ordinals are assigned chronologically after
+// the cap is applied, so the newest surfaced message is `result.at(-1)`.
+export function extractMessageBlocks(entries: any[], cap = DEFAULT_MESSAGE_CAP): MessageBlocks[] {
+  const collected: CodeBlock[][] = [];
+
+  for (const entry of entries) {
+    const text = assistantMessageText(entry);
+    if (!text.trim()) {
       continue;
     }
 
-    const text = message.content
-      .filter((content: any) => content?.type === "text" && typeof content.text === "string")
-      .map((content: any) => content.text)
-      .join("\n");
-
-    if (text.trim()) {
-      return text;
+    const blocks = extractCodeBlocks(text);
+    if (blocks.length === 0) {
+      continue;
     }
+
+    collected.push(blocks);
   }
 
-  return undefined;
+  const tail = cap > 0 ? collected.slice(-cap) : collected.slice();
+  return tail.map((blocks, i) => ({ ordinal: i + 1, blocks }));
+}
+
+function collectAssistantCodeBlocks(ctx: AnyContext, cap = DEFAULT_MESSAGE_CAP): MessageBlocks[] {
+  return extractMessageBlocks(resolveEntries(ctx), cap);
 }
 
 export function extractCodeBlocks(markdown: string): CodeBlock[] {
@@ -175,6 +209,61 @@ export function wrapIndex(index: number, delta: number, count: number): number {
   return ((index + delta) % count + count) % count;
 }
 
+// Display-order labels for the response tab strip, laid out left-to-right with
+// the newest response first. The current (newest) response is "Current" and
+// older responses count how many steps back they are ("Prev 1", "Prev 2", ...).
+// Index 0 is the leftmost (current) tab.
+export function responseTabLabels(count: number): string[] {
+  return Array.from({ length: count }, (_, i) => (i === 0 ? "Current" : `Prev ${i}`));
+}
+
+// Pure horizontal-scroll window for the tab strip. Given each tab cell's visible
+// width, the active tab index, and the available width, returns the [start, end)
+// index window that fits, always including activeIndex. A single-column marker is
+// reserved on each side when there are more tabs off-screen. Separators between
+// adjacent tabs are 1 column and accounted for internally. Expansion prefers the
+// newer (right) neighbors first so context leans toward the latest response.
+export function tabWindow(
+  cellWidths: number[],
+  activeIndex: number,
+  width: number,
+): { start: number; end: number; leftMore: boolean; rightMore: boolean } {
+  const n = cellWidths.length;
+  if (n === 0) {
+    return { start: 0, end: 0, leftMore: false, rightMore: false };
+  }
+
+  const sep = 1;
+  const totalAll = cellWidths.reduce((sum, w) => sum + w, 0) + (n - 1) * sep;
+  if (totalAll <= width) {
+    return { start: 0, end: n, leftMore: false, rightMore: false };
+  }
+
+  // Reserve up to one column per side for the ‹ / › markers while scrolling.
+  const budget = Math.max(1, width - 2);
+  const active = Math.min(Math.max(0, activeIndex), n - 1);
+
+  let start = active;
+  let end = active + 1; // [start, end)
+  let used = cellWidths[active];
+  let grow = true;
+  while (grow) {
+    grow = false;
+    if (end < n && used + sep + cellWidths[end] <= budget) {
+      used += sep + cellWidths[end];
+      end += 1;
+      grow = true;
+    }
+    if (start - 1 >= 0 && used + sep + cellWidths[start - 1] <= budget) {
+      used += sep + cellWidths[start - 1];
+      start -= 1;
+      grow = true;
+    }
+  }
+
+  return { start, end, leftMore: start > 0, rightMore: end < n };
+}
+
 // Case-insensitive subsequence fuzzy score. Returns -1 when the query does not
 // match. Higher scores reward earlier matches and contiguous runs.
 export function fuzzyScore(text: string, query: string): number {
@@ -268,27 +357,47 @@ function isPrintable(data: string): boolean {
 
 class CodeBlockPickerComponent {
   private selected = 0;
-  private items: CopyChoice[];
+  private messageIndex: number;
+  private readonly choicesByMessage: CopyChoice[][];
+  private readonly maxChoices: number;
   private query = "";
   private searching = false;
 
   constructor(
-    blocks: CodeBlock[],
+    private messages: MessageBlocks[],
     private theme: Theme,
     private mdTheme: MarkdownTheme,
     private tui: TUI,
     private enterAction: CopyAction,
     private done: (result: PickerResult) => void,
   ) {
-    this.items = createCopyChoices(blocks);
+    this.choicesByMessage = messages.map((message) => createCopyChoices(message.blocks));
+    this.maxChoices = this.choicesByMessage.reduce((max, choices) => Math.max(max, choices.length), 1);
+    // Start on the newest message, matching the previous "latest message" behavior.
+    this.messageIndex = Math.max(0, messages.length - 1);
   }
 
   private activeQuery(): string {
     return this.searching ? this.query : "";
   }
 
+  private currentChoices(): CopyChoice[] {
+    return this.choicesByMessage[this.messageIndex] ?? [];
+  }
+
   private visibleItems(): CopyChoice[] {
-    return filterCopyChoices(this.items, this.activeQuery());
+    return filterCopyChoices(this.currentChoices(), this.activeQuery());
+  }
+
+  private switchMessage(delta: number): void {
+    if (this.messages.length <= 1) {
+      return;
+    }
+    this.messageIndex = wrapIndex(this.messageIndex, delta, this.messages.length);
+    this.selected = 0;
+    this.searching = false;
+    this.query = "";
+    this.tui.requestRender();
   }
 
   private exitSearch(): void {
@@ -298,18 +407,67 @@ class CodeBlockPickerComponent {
     this.tui.requestRender();
   }
 
+  // Builds the full-width response tab strip, scrolled so the active tab is
+  // always visible. Returns exactly `innerWidth` visible columns of content
+  // (styled), without the surrounding box borders.
+  private renderTabStrip(innerWidth: number): string {
+    const count = this.messages.length;
+    // Messages are stored chronologically (index 0 oldest, tail newest), but the
+    // strip is displayed newest-first, so map the active message to its display
+    // slot: display 0 = current (newest) = leftmost.
+    const activeDisplay = count - 1 - this.messageIndex;
+    const labels = responseTabLabels(count);
+    const cells = labels.map((label) => ` ${label} `);
+    const cellWidths = cells.map((cell) => visibleWidth(cell));
+    const win = tabWindow(cellWidths, activeDisplay, innerWidth);
+    const scrolling = win.leftMore || win.rightMore;
+
+    const border = (s: string) => this.theme.fg("border", s);
+    let out = "";
+    let vis = 0;
+
+    if (scrolling) {
+      out += win.leftMore ? this.theme.fg("accent", "‹") : " ";
+      vis += 1;
+    }
+
+    for (let i = win.start; i < win.end; i++) {
+      if (i > win.start) {
+        out += border("│");
+        vis += 1;
+      }
+      out +=
+        i === activeDisplay
+          ? this.theme.fg("accent", cells[i])
+          : this.theme.fg("dim", cells[i]);
+      vis += cellWidths[i];
+    }
+
+    if (scrolling) {
+      const rightMarker = win.rightMore ? this.theme.fg("accent", "›") : " ";
+      const pad = Math.max(0, innerWidth - vis - 1);
+      out += " ".repeat(pad) + rightMarker;
+    } else {
+      out += " ".repeat(Math.max(0, innerWidth - vis));
+    }
+
+    return out;
+  }
+
   render(width: number): string[] {
     const listWidth = Math.min(36, Math.floor(width * 0.38));
     const previewWidth = Math.max(10, width - listWidth - 3);
-    const maxHeight = Math.min(28, Math.max(this.items.length + 6, 14));
+    const maxHeight = Math.min(28, Math.max(this.maxChoices + 6, 14));
 
     const visibleItems = this.visibleItems();
     if (this.selected >= visibleItems.length) {
       this.selected = Math.max(0, visibleItems.length - 1);
     }
 
+    const innerWidth = listWidth + previewWidth + 1;
     const boxRows = maxHeight - 2;
     const showSearch = this.searching;
+    const showStrip = this.messages.length > 1;
     const searchRows = showSearch ? 1 : 0;
     const itemRows = Math.max(1, boxRows - searchRows);
 
@@ -320,11 +478,10 @@ class CodeBlockPickerComponent {
 
     const leftLines: string[] = [];
     if (showSearch) {
-      const counter = `${visibleItems.length}/${this.items.length}`;
+      const counter = `${visibleItems.length}/${this.currentChoices().length}`;
       const searchLine = `/${this.query}█  ${counter}`;
       leftLines.push(truncateToWidth(this.theme.fg("accent", searchLine), listWidth, undefined, true));
     }
-
     if (visibleItems.length === 0) {
       leftLines.push(truncateToWidth(this.theme.fg("dim", "  (no matches)"), listWidth, undefined, true));
     } else {
@@ -352,13 +509,25 @@ class CodeBlockPickerComponent {
     const divider = border("│");
     const lines: string[] = [];
 
-    lines.push(
-      border("┌") +
-        border("─".repeat(listWidth)) +
-        border("┬") +
-        border("─".repeat(previewWidth)) +
-        border("┐"),
-    );
+    if (showStrip) {
+      lines.push(border("┌") + border("─".repeat(innerWidth)) + border("┐"));
+      lines.push(divider + this.renderTabStrip(innerWidth) + divider);
+      lines.push(
+        border("├") +
+          border("─".repeat(listWidth)) +
+          border("┬") +
+          border("─".repeat(previewWidth)) +
+          border("┤"),
+      );
+    } else {
+      lines.push(
+        border("┌") +
+          border("─".repeat(listWidth)) +
+          border("┬") +
+          border("─".repeat(previewWidth)) +
+          border("┐"),
+      );
+    }
 
     for (let i = 0; i < boxRows; i++) {
       const left = leftLines[i] || " ".repeat(listWidth);
@@ -375,9 +544,10 @@ class CodeBlockPickerComponent {
     );
 
     const enterLabel = this.enterAction === "edit" ? "enter edit" : "enter copy";
+    const msgSegment = this.messages.length > 1 ? "←/→ responses • " : "";
     const hint = this.searching
       ? ` ↑↓ navigate • ${enterLabel} • ⌫/esc back `
-      : ` ↑↓/j/k navigate • ${enterLabel} • e edit • / search • esc/q cancel `;
+      : ` ${msgSegment}↑↓/j/k blocks • ${enterLabel} • e edit • / search • esc/q cancel `;
     const hintWidth = visibleWidth(hint);
     const pad = Math.max(0, width - hintWidth);
     lines.push(this.theme.fg("dim", " ".repeat(Math.floor(pad / 2)) + hint));
@@ -424,6 +594,12 @@ class CodeBlockPickerComponent {
       this.query = "";
       this.selected = 0;
       this.tui.requestRender();
+    } else if (matchesKey(data, "left") || matchesKey(data, "shift+tab")) {
+      // Left / shift+tab move toward the current (newest) response.
+      this.switchMessage(1);
+    } else if (matchesKey(data, "right") || matchesKey(data, "tab")) {
+      // Right / tab walk back through older responses.
+      this.switchMessage(-1);
     } else if (matchesKey(data, "up") || data === "k") {
       this.selected = wrapIndex(this.selected, -1, visibleItems.length);
       this.tui.requestRender();
@@ -449,19 +625,21 @@ class CodeBlockPickerComponent {
 }
 
 async function chooseCopyAction(
-  blocks: CodeBlock[],
+  messages: MessageBlocks[],
   ctx: AnyContext,
   enterAction: CopyAction,
 ): Promise<PickerResult> {
-  if (blocks.length === 1) {
-    return { action: enterAction, code: blocks[0].code };
+  // Only shortcut past the picker when there is a single block in a single
+  // message; otherwise the picker is needed to navigate messages or blocks.
+  if (messages.length === 1 && messages[0].blocks.length === 1) {
+    return { action: enterAction, code: messages[0].blocks[0].code };
   }
 
   const mdTheme = { ...getMarkdownTheme(), codeBlockIndent: "" };
 
   return await ctx.ui.custom<PickerResult>(
     (tui, theme, _keybindings, done) =>
-      new CodeBlockPickerComponent(blocks, theme, mdTheme, tui, enterAction, done),
+      new CodeBlockPickerComponent(messages, theme, mdTheme, tui, enterAction, done),
     { overlay: true },
   );
 }
@@ -598,15 +776,9 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
       await ctx.waitForIdle();
     }
 
-    const markdown = latestAssistantMarkdown(ctx);
-    if (!markdown) {
-      ctx.ui.notify("No assistant message found", "warning");
-      return;
-    }
-
-    const blocks = extractCodeBlocks(markdown);
-    if (blocks.length === 0) {
-      ctx.ui.notify("No code blocks found in the last assistant message", "warning");
+    const messages = collectAssistantCodeBlocks(ctx, DEFAULT_MESSAGE_CAP);
+    if (messages.length === 0) {
+      ctx.ui.notify("No code blocks found in recent assistant messages", "warning");
       return;
     }
 
@@ -614,7 +786,7 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
     let text: string | undefined;
 
     if (!arg || arg === "edit") {
-      const result = await chooseCopyAction(blocks, ctx, arg === "edit" ? "edit" : "copy");
+      const result = await chooseCopyAction(messages, ctx, arg === "edit" ? "edit" : "copy");
       if (result === undefined) {
         ctx.ui.notify("Copy cancelled", "info");
         return;
@@ -646,12 +818,13 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("copy-code", {
-    description: "Copy code from the latest assistant message; prompts when multiple blocks",
+    description:
+      "Copy code from recent assistant messages; opens a picker to choose blocks and page across responses",
     handler: run,
   });
 
   pi.registerShortcut("ctrl+alt+c", {
-    description: "Copy code from the latest assistant message",
+    description: "Copy code from recent assistant messages",
     handler: (ctx) => run("", ctx),
   });
 }
