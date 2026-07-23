@@ -786,7 +786,8 @@ async function editCodeBeforeCopy(
 
 export default function copyCodeExtension(pi: ExtensionAPI) {
   let unsubscribeTerminalInput: (() => void) | undefined;
-  let terminalCopyCodeInFlight = false;
+  let sessionEpoch = 0;
+  let activeRunEpoch: number | undefined;
 
   function clearTerminalInputListener(): void {
     unsubscribeTerminalInput?.();
@@ -844,17 +845,20 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
   }
 
   async function runGuarded(args: string, ctx: AnyContext): Promise<void> {
-    if (terminalCopyCodeInFlight) {
+    if (activeRunEpoch !== undefined) {
       return;
     }
 
-    terminalCopyCodeInFlight = true;
+    const runEpoch = sessionEpoch;
+    activeRunEpoch = runEpoch;
     try {
       await run(args, ctx);
     } catch (error) {
       notifyUnexpectedError(error, ctx);
     } finally {
-      terminalCopyCodeInFlight = false;
+      if (activeRunEpoch === runEpoch && sessionEpoch === runEpoch) {
+        activeRunEpoch = undefined;
+      }
     }
   }
 
@@ -871,7 +875,8 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     clearTerminalInputListener();
-    terminalCopyCodeInFlight = false;
+    sessionEpoch += 1;
+    activeRunEpoch = undefined;
 
     if (!ctx.hasUI) {
       return;
@@ -886,6 +891,7 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     clearTerminalInputListener();
-    terminalCopyCodeInFlight = false;
+    sessionEpoch += 1;
+    activeRunEpoch = undefined;
   });
 }

@@ -462,6 +462,46 @@ test("session restart clears an abandoned in-flight guard", async () => {
   assert.equal(chooseCount, 2);
 });
 
+test("stale session completion cannot clear the active session guard", async () => {
+  const { handlers, listeners, cleanupCalls, commands } = registerForTerminalInputTests();
+  let chooseCount = 0;
+  const finishChoosing = [];
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing.push(() => resolve(undefined));
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  void commands[0].options.handler("", ctx);
+  assert.equal(chooseCount, 1);
+
+  handlers.get("session_shutdown")({}, ctx);
+  handlers.get("session_start")({}, ctx);
+  const currentListener = listeners.at(-1);
+  currentListener("\x1b\x03");
+  assert.equal(chooseCount, 2);
+
+  finishChoosing[0]();
+  await waitForMicrotasks();
+  currentListener("\x1b\x03");
+  assert.equal(chooseCount, 2, "the stale run must not release the current session guard");
+
+  finishChoosing[1]();
+  await waitForMicrotasks();
+  currentListener("\x1b\x03");
+  assert.equal(chooseCount, 3);
+
+  finishChoosing[2]();
+  await waitForMicrotasks();
+});
+
 function registerForTerminalInputTests() {
   const handlers = new Map();
   const listeners = [];
