@@ -258,6 +258,111 @@ test("terminal listener consumes ctrl+alt+c and runs copy-code once", () => {
   assert.deepEqual(notifications, [{ message: "No assistant message found", type: "warning" }]);
 });
 
+test("terminal listener consumes matching presses while copy-code is in flight without starting another run", async () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  let chooseCount = 0;
+  let finishChoosing;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing = () => resolve(undefined);
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const first = listeners[0]("\x1b\x03");
+  const second = listeners[0]("\x1b\x03");
+
+  assert.deepEqual(first, { consume: true });
+  assert.deepEqual(second, { consume: true });
+  assert.equal(chooseCount, 1);
+
+  finishChoosing();
+  await waitForMicrotasks();
+
+  assert.equal(chooseCount, 1);
+  assert.deepEqual(notifications, [{ message: "Copy cancelled", type: "info" }]);
+});
+
+test("terminal listener allows a later matching press after in-flight copy-code settles", async () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  let chooseCount = 0;
+  let finishChoosing;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing = () => resolve(undefined);
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const first = listeners[0]("\x1b\x03");
+  assert.deepEqual(first, { consume: true });
+  assert.equal(chooseCount, 1);
+
+  finishChoosing();
+  await waitForMicrotasks();
+  assert.equal(chooseCount, 1);
+
+  const second = listeners[0]("\x1b\x03");
+  assert.deepEqual(second, { consume: true });
+  assert.equal(chooseCount, 2);
+
+  finishChoosing();
+  await waitForMicrotasks();
+
+  assert.equal(chooseCount, 2);
+  assert.deepEqual(notifications, [
+    { message: "Copy cancelled", type: "info" },
+    { message: "Copy cancelled", type: "info" },
+  ]);
+});
+
+test("terminal listener clears in-flight state after copy-code rejects", async () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  let customCalls = 0;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      customCalls += 1;
+      return Promise.reject(new Error(`picker failed ${customCalls}`));
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const first = listeners[0]("\x1b\x03");
+  assert.deepEqual(first, { consume: true });
+  await waitForMicrotasks();
+
+  const second = listeners[0]("\x1b\x03");
+  assert.deepEqual(second, { consume: true });
+  await waitForMicrotasks();
+
+  assert.equal(customCalls, 2);
+  assert.deepEqual(notifications, [
+    { message: "Copy failed: picker failed 1", type: "error" },
+    { message: "Copy failed: picker failed 2", type: "error" },
+  ]);
+});
+
 test("terminal listener passes nonmatching input through", () => {
   const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
   const notifications = [];
@@ -267,6 +372,28 @@ test("terminal listener passes nonmatching input through", () => {
   const result = listeners[0]("x");
 
   assert.equal(result, undefined);
+  assert.deepEqual(notifications, []);
+});
+
+test("terminal listener preserves ctrl+alt+c release and repeat behavior", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      throw new Error("release/repeat should not run copy-code");
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const repeat = listeners[0]("\x1b[99;7:2u");
+  const release = listeners[0]("\x1b[99;7:3u");
+
+  assert.deepEqual(repeat, { consume: true });
+  assert.deepEqual(release, { consume: true });
   assert.deepEqual(notifications, []);
 });
 
@@ -298,7 +425,13 @@ function registerForTerminalInputTests() {
   return { handlers, listeners, cleanupCalls };
 }
 
-function createTerminalInputContext({ listeners, cleanupCalls, notifications = [] }) {
+function createTerminalInputContext({
+  listeners,
+  cleanupCalls,
+  notifications = [],
+  markdown,
+  custom = () => Promise.resolve(undefined),
+}) {
   return {
     hasUI: true,
     isIdle: () => true,
@@ -310,9 +443,22 @@ function createTerminalInputContext({ listeners, cleanupCalls, notifications = [
         const index = listeners.push(handler) - 1;
         return () => cleanupCalls.push(index);
       },
+      custom,
     },
     sessionManager: {
-      getEntries: () => [],
+      getEntries: () =>
+        markdown
+          ? [
+              {
+                type: "message",
+                message: { role: "assistant", content: [{ type: "text", text: markdown }] },
+              },
+            ]
+          : [],
     },
   };
+}
+
+async function waitForMicrotasks() {
+  await new Promise((resolve) => setImmediate(resolve));
 }

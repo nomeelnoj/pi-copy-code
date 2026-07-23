@@ -786,6 +786,7 @@ async function editCodeBeforeCopy(
 
 export default function copyCodeExtension(pi: ExtensionAPI) {
   let unsubscribeTerminalInput: (() => void) | undefined;
+  let terminalCopyCodeInFlight = false;
 
   function clearTerminalInputListener(): void {
     unsubscribeTerminalInput?.();
@@ -863,7 +864,16 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
 
     unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) =>
       handleCopyCodeTerminalInput(data, () => {
-        void run("", ctx).catch((error) => notifyUnexpectedError(error, ctx));
+        if (terminalCopyCodeInFlight) {
+          return;
+        }
+
+        terminalCopyCodeInFlight = true;
+        void run("", ctx)
+          .catch((error) => notifyUnexpectedError(error, ctx))
+          .finally(() => {
+            terminalCopyCodeInFlight = false;
+          });
       }),
     );
   });
