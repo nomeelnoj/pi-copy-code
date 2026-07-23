@@ -216,9 +216,12 @@ test("splitEditorCommand preserves quoted editor commands", () => {
 });
 
 test("extension registers /copy-code and ctrl+alt+c", () => {
-  const registered = { commands: [], shortcuts: [] };
+  const registered = { commands: [], shortcuts: [], handlers: new Map() };
 
   extension.default({
+    on(event, handler) {
+      registered.handlers.set(event, handler);
+    },
     registerCommand(name, options) {
       registered.commands.push({ name, options });
     },
@@ -229,4 +232,87 @@ test("extension registers /copy-code and ctrl+alt+c", () => {
 
   assert.equal(registered.commands[0].name, "copy-code");
   assert.equal(registered.shortcuts[0].shortcut, "ctrl+alt+c");
+  assert.equal(typeof registered.handlers.get("session_start"), "function");
+  assert.equal(typeof registered.handlers.get("session_shutdown"), "function");
 });
+
+test("session_start registers a terminal listener for ctrl+alt+c", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls });
+
+  handlers.get("session_start")({}, ctx);
+
+  assert.equal(listeners.length, 1);
+  assert.equal(cleanupCalls.length, 0);
+});
+
+test("terminal listener consumes ctrl+alt+c and runs copy-code once", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls, notifications });
+
+  handlers.get("session_start")({}, ctx);
+  const result = listeners[0]("\x1b\x03");
+
+  assert.deepEqual(result, { consume: true });
+  assert.deepEqual(notifications, [{ message: "No assistant message found", type: "warning" }]);
+});
+
+test("terminal listener passes nonmatching input through", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls, notifications });
+
+  handlers.get("session_start")({}, ctx);
+  const result = listeners[0]("x");
+
+  assert.equal(result, undefined);
+  assert.deepEqual(notifications, []);
+});
+
+test("terminal listener is cleaned up on session shutdown and before re-registration", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls });
+
+  handlers.get("session_start")({}, ctx);
+  handlers.get("session_start")({}, ctx);
+  assert.deepEqual(cleanupCalls, [0]);
+
+  handlers.get("session_shutdown")({}, ctx);
+  assert.deepEqual(cleanupCalls, [0, 1]);
+});
+
+function registerForTerminalInputTests() {
+  const handlers = new Map();
+  const listeners = [];
+  const cleanupCalls = [];
+
+  extension.default({
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+    registerCommand() {},
+    registerShortcut() {},
+  });
+
+  return { handlers, listeners, cleanupCalls };
+}
+
+function createTerminalInputContext({ listeners, cleanupCalls, notifications = [] }) {
+  return {
+    hasUI: true,
+    isIdle: () => true,
+    ui: {
+      notify(message, type) {
+        notifications.push({ message, type });
+      },
+      onTerminalInput(handler) {
+        const index = listeners.push(handler) - 1;
+        return () => cleanupCalls.push(index);
+      },
+    },
+    sessionManager: {
+      getEntries: () => [],
+    },
+  };
+}

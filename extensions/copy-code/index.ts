@@ -5,7 +5,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, isKeyRepeat, Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { MarkdownTheme, TUI } from "@earendil-works/pi-tui";
 import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
@@ -44,6 +44,20 @@ type PickerResult = {
   action: CopyAction;
   code: string;
 } | undefined;
+
+type TerminalInputResult = { consume?: boolean; data?: string } | undefined;
+
+export function handleCopyCodeTerminalInput(data: string, runCopyCode: () => void): TerminalInputResult {
+  if (!matchesKey(data, "ctrl+alt+c")) {
+    return undefined;
+  }
+
+  if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+    runCopyCode();
+  }
+
+  return { consume: true };
+}
 
 function resolveEntries(ctx: AnyContext): any[] {
   const sessionManager = ctx.sessionManager as any;
@@ -771,6 +785,18 @@ async function editCodeBeforeCopy(
 }
 
 export default function copyCodeExtension(pi: ExtensionAPI) {
+  let unsubscribeTerminalInput: (() => void) | undefined;
+
+  function clearTerminalInputListener(): void {
+    unsubscribeTerminalInput?.();
+    unsubscribeTerminalInput = undefined;
+  }
+
+  function notifyUnexpectedError(error: unknown, ctx: AnyContext): void {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Copy failed: ${message}`, "error");
+  }
+
   async function run(args: string, ctx: AnyContext): Promise<void> {
     if ("waitForIdle" in ctx) {
       await ctx.waitForIdle();
@@ -826,5 +852,23 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
   pi.registerShortcut("ctrl+alt+c", {
     description: "Copy code from recent assistant messages",
     handler: (ctx) => run("", ctx),
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    clearTerminalInputListener();
+
+    if (!ctx.hasUI) {
+      return;
+    }
+
+    unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) =>
+      handleCopyCodeTerminalInput(data, () => {
+        void run("", ctx).catch((error) => notifyUnexpectedError(error, ctx));
+      }),
+    );
+  });
+
+  pi.on("session_shutdown", () => {
+    clearTerminalInputListener();
   });
 }
