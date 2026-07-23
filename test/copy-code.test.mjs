@@ -255,7 +255,7 @@ test("terminal listener consumes ctrl+alt+c and runs copy-code once", () => {
   const result = listeners[0]("\x1b\x03");
 
   assert.deepEqual(result, { consume: true });
-  assert.deepEqual(notifications, [{ message: "No assistant message found", type: "warning" }]);
+  assert.deepEqual(notifications, [{ message: "No code blocks found in recent assistant messages", type: "warning" }]);
 });
 
 test("terminal listener consumes matching presses while copy-code is in flight without starting another run", async () => {
