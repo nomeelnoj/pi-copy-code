@@ -409,20 +409,79 @@ test("terminal listener is cleaned up on session shutdown and before re-registra
   assert.deepEqual(cleanupCalls, [0, 1]);
 });
 
+test("command and terminal entry points share the in-flight guard", async () => {
+  const { handlers, listeners, cleanupCalls, commands } = registerForTerminalInputTests();
+  let chooseCount = 0;
+  let finishChoosing;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing = () => resolve(undefined);
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const commandRun = commands[0].options.handler("", ctx);
+  const terminalResult = listeners[0]("\x1b\x03");
+
+  assert.deepEqual(terminalResult, { consume: true });
+  assert.equal(chooseCount, 1);
+
+  finishChoosing();
+  await commandRun;
+});
+
+test("session restart clears an abandoned in-flight guard", async () => {
+  const { handlers, listeners, cleanupCalls, commands } = registerForTerminalInputTests();
+  let chooseCount = 0;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise(() => {});
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  void commands[0].options.handler("", ctx);
+  assert.equal(chooseCount, 1);
+
+  handlers.get("session_shutdown")({}, ctx);
+  handlers.get("session_start")({}, ctx);
+  const terminalResult = listeners.at(-1)("\x1b\x03");
+  await waitForMicrotasks();
+
+  assert.deepEqual(terminalResult, { consume: true });
+  assert.equal(chooseCount, 2);
+});
+
 function registerForTerminalInputTests() {
   const handlers = new Map();
   const listeners = [];
   const cleanupCalls = [];
+  const commands = [];
+  const shortcuts = [];
 
   extension.default({
     on(event, handler) {
       handlers.set(event, handler);
     },
-    registerCommand() {},
-    registerShortcut() {},
+    registerCommand(name, options) {
+      commands.push({ name, options });
+    },
+    registerShortcut(shortcut, options) {
+      shortcuts.push({ shortcut, options });
+    },
   });
 
-  return { handlers, listeners, cleanupCalls };
+  return { handlers, listeners, cleanupCalls, commands, shortcuts };
 }
 
 function createTerminalInputContext({

@@ -839,24 +839,39 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
       const lines = lineCount(text);
       ctx.ui.notify(`Copied ${lines} line${lines === 1 ? "" : "s"} via ${via}`, "info");
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Copy failed: ${message}`, "error");
+      notifyUnexpectedError(error, ctx);
+    }
+  }
+
+  async function runGuarded(args: string, ctx: AnyContext): Promise<void> {
+    if (terminalCopyCodeInFlight) {
+      return;
+    }
+
+    terminalCopyCodeInFlight = true;
+    try {
+      await run(args, ctx);
+    } catch (error) {
+      notifyUnexpectedError(error, ctx);
+    } finally {
+      terminalCopyCodeInFlight = false;
     }
   }
 
   pi.registerCommand("copy-code", {
     description:
       "Copy code from recent assistant messages; opens a picker to choose blocks and page across responses",
-    handler: run,
+    handler: runGuarded,
   });
 
   pi.registerShortcut("ctrl+alt+c", {
     description: "Copy code from recent assistant messages",
-    handler: (ctx) => run("", ctx),
+    handler: (ctx) => runGuarded("", ctx),
   });
 
   pi.on("session_start", (_event, ctx) => {
     clearTerminalInputListener();
+    terminalCopyCodeInFlight = false;
 
     if (!ctx.hasUI) {
       return;
@@ -864,21 +879,13 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
 
     unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) =>
       handleCopyCodeTerminalInput(data, () => {
-        if (terminalCopyCodeInFlight) {
-          return;
-        }
-
-        terminalCopyCodeInFlight = true;
-        void run("", ctx)
-          .catch((error) => notifyUnexpectedError(error, ctx))
-          .finally(() => {
-            terminalCopyCodeInFlight = false;
-          });
+        void runGuarded("", ctx);
       }),
     );
   });
 
   pi.on("session_shutdown", () => {
     clearTerminalInputListener();
+    terminalCopyCodeInFlight = false;
   });
 }
