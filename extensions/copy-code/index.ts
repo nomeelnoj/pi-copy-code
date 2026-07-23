@@ -5,7 +5,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, isKeyRepeat, Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { MarkdownTheme, TUI } from "@earendil-works/pi-tui";
 import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
@@ -44,6 +44,20 @@ type PickerResult = {
   action: CopyAction;
   code: string;
 } | undefined;
+
+type TerminalInputResult = { consume?: boolean; data?: string } | undefined;
+
+export function handleCopyCodeTerminalInput(data: string, runCopyCode: () => void): TerminalInputResult {
+  if (!matchesKey(data, "ctrl+alt+c")) {
+    return undefined;
+  }
+
+  if (!isKeyRelease(data) && !isKeyRepeat(data)) {
+    runCopyCode();
+  }
+
+  return { consume: true };
+}
 
 function resolveEntries(ctx: AnyContext): any[] {
   const sessionManager = ctx.sessionManager as any;
@@ -771,6 +785,20 @@ async function editCodeBeforeCopy(
 }
 
 export default function copyCodeExtension(pi: ExtensionAPI) {
+  let unsubscribeTerminalInput: (() => void) | undefined;
+  let sessionEpoch = 0;
+  let activeRunEpoch: number | undefined;
+
+  function clearTerminalInputListener(): void {
+    unsubscribeTerminalInput?.();
+    unsubscribeTerminalInput = undefined;
+  }
+
+  function notifyUnexpectedError(error: unknown, ctx: AnyContext): void {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Copy failed: ${message}`, "error");
+  }
+
   async function run(args: string, ctx: AnyContext): Promise<void> {
     if ("waitForIdle" in ctx) {
       await ctx.waitForIdle();
@@ -812,19 +840,58 @@ export default function copyCodeExtension(pi: ExtensionAPI) {
       const lines = lineCount(text);
       ctx.ui.notify(`Copied ${lines} line${lines === 1 ? "" : "s"} via ${via}`, "info");
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Copy failed: ${message}`, "error");
+      notifyUnexpectedError(error, ctx);
+    }
+  }
+
+  async function runGuarded(args: string, ctx: AnyContext): Promise<void> {
+    if (activeRunEpoch !== undefined) {
+      return;
+    }
+
+    const runEpoch = sessionEpoch;
+    activeRunEpoch = runEpoch;
+    try {
+      await run(args, ctx);
+    } catch (error) {
+      notifyUnexpectedError(error, ctx);
+    } finally {
+      if (activeRunEpoch === runEpoch && sessionEpoch === runEpoch) {
+        activeRunEpoch = undefined;
+      }
     }
   }
 
   pi.registerCommand("copy-code", {
     description:
       "Copy code from recent assistant messages; opens a picker to choose blocks and page across responses",
-    handler: run,
+    handler: runGuarded,
   });
 
   pi.registerShortcut("ctrl+alt+c", {
     description: "Copy code from recent assistant messages",
-    handler: (ctx) => run("", ctx),
+    handler: (ctx) => runGuarded("", ctx),
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    clearTerminalInputListener();
+    sessionEpoch += 1;
+    activeRunEpoch = undefined;
+
+    if (!ctx.hasUI) {
+      return;
+    }
+
+    unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) =>
+      handleCopyCodeTerminalInput(data, () => {
+        void runGuarded("", ctx);
+      }),
+    );
+  });
+
+  pi.on("session_shutdown", () => {
+    clearTerminalInputListener();
+    sessionEpoch += 1;
+    activeRunEpoch = undefined;
   });
 }

@@ -216,9 +216,12 @@ test("splitEditorCommand preserves quoted editor commands", () => {
 });
 
 test("extension registers /copy-code and ctrl+alt+c", () => {
-  const registered = { commands: [], shortcuts: [] };
+  const registered = { commands: [], shortcuts: [], handlers: new Map() };
 
   extension.default({
+    on(event, handler) {
+      registered.handlers.set(event, handler);
+    },
     registerCommand(name, options) {
       registered.commands.push({ name, options });
     },
@@ -229,4 +232,332 @@ test("extension registers /copy-code and ctrl+alt+c", () => {
 
   assert.equal(registered.commands[0].name, "copy-code");
   assert.equal(registered.shortcuts[0].shortcut, "ctrl+alt+c");
+  assert.equal(typeof registered.handlers.get("session_start"), "function");
+  assert.equal(typeof registered.handlers.get("session_shutdown"), "function");
 });
+
+test("session_start registers a terminal listener for ctrl+alt+c", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls });
+
+  handlers.get("session_start")({}, ctx);
+
+  assert.equal(listeners.length, 1);
+  assert.equal(cleanupCalls.length, 0);
+});
+
+test("terminal listener consumes ctrl+alt+c and runs copy-code once", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls, notifications });
+
+  handlers.get("session_start")({}, ctx);
+  const result = listeners[0]("\x1b\x03");
+
+  assert.deepEqual(result, { consume: true });
+  assert.deepEqual(notifications, [{ message: "No code blocks found in recent assistant messages", type: "warning" }]);
+});
+
+test("terminal listener consumes matching presses while copy-code is in flight without starting another run", async () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  let chooseCount = 0;
+  let finishChoosing;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing = () => resolve(undefined);
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const first = listeners[0]("\x1b\x03");
+  const second = listeners[0]("\x1b\x03");
+
+  assert.deepEqual(first, { consume: true });
+  assert.deepEqual(second, { consume: true });
+  assert.equal(chooseCount, 1);
+
+  finishChoosing();
+  await waitForMicrotasks();
+
+  assert.equal(chooseCount, 1);
+  assert.deepEqual(notifications, [{ message: "Copy cancelled", type: "info" }]);
+});
+
+test("terminal listener allows a later matching press after in-flight copy-code settles", async () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  let chooseCount = 0;
+  let finishChoosing;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing = () => resolve(undefined);
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const first = listeners[0]("\x1b\x03");
+  assert.deepEqual(first, { consume: true });
+  assert.equal(chooseCount, 1);
+
+  finishChoosing();
+  await waitForMicrotasks();
+  assert.equal(chooseCount, 1);
+
+  const second = listeners[0]("\x1b\x03");
+  assert.deepEqual(second, { consume: true });
+  assert.equal(chooseCount, 2);
+
+  finishChoosing();
+  await waitForMicrotasks();
+
+  assert.equal(chooseCount, 2);
+  assert.deepEqual(notifications, [
+    { message: "Copy cancelled", type: "info" },
+    { message: "Copy cancelled", type: "info" },
+  ]);
+});
+
+test("terminal listener clears in-flight state after copy-code rejects", async () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  let customCalls = 0;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      customCalls += 1;
+      return Promise.reject(new Error(`picker failed ${customCalls}`));
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const first = listeners[0]("\x1b\x03");
+  assert.deepEqual(first, { consume: true });
+  await waitForMicrotasks();
+
+  const second = listeners[0]("\x1b\x03");
+  assert.deepEqual(second, { consume: true });
+  await waitForMicrotasks();
+
+  assert.equal(customCalls, 2);
+  assert.deepEqual(notifications, [
+    { message: "Copy failed: picker failed 1", type: "error" },
+    { message: "Copy failed: picker failed 2", type: "error" },
+  ]);
+});
+
+test("terminal listener passes nonmatching input through", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls, notifications });
+
+  handlers.get("session_start")({}, ctx);
+  const result = listeners[0]("x");
+
+  assert.equal(result, undefined);
+  assert.deepEqual(notifications, []);
+});
+
+test("terminal listener preserves ctrl+alt+c release and repeat behavior", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const notifications = [];
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    notifications,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      throw new Error("release/repeat should not run copy-code");
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const repeat = listeners[0]("\x1b[99;7:2u");
+  const release = listeners[0]("\x1b[99;7:3u");
+
+  assert.deepEqual(repeat, { consume: true });
+  assert.deepEqual(release, { consume: true });
+  assert.deepEqual(notifications, []);
+});
+
+test("terminal listener is cleaned up on session shutdown and before re-registration", () => {
+  const { handlers, listeners, cleanupCalls } = registerForTerminalInputTests();
+  const ctx = createTerminalInputContext({ listeners, cleanupCalls });
+
+  handlers.get("session_start")({}, ctx);
+  handlers.get("session_start")({}, ctx);
+  assert.deepEqual(cleanupCalls, [0]);
+
+  handlers.get("session_shutdown")({}, ctx);
+  assert.deepEqual(cleanupCalls, [0, 1]);
+});
+
+test("command and terminal entry points share the in-flight guard", async () => {
+  const { handlers, listeners, cleanupCalls, commands } = registerForTerminalInputTests();
+  let chooseCount = 0;
+  let finishChoosing;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing = () => resolve(undefined);
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  const commandRun = commands[0].options.handler("", ctx);
+  const terminalResult = listeners[0]("\x1b\x03");
+
+  assert.deepEqual(terminalResult, { consume: true });
+  assert.equal(chooseCount, 1);
+
+  finishChoosing();
+  await commandRun;
+});
+
+test("session restart clears an abandoned in-flight guard", async () => {
+  const { handlers, listeners, cleanupCalls, commands } = registerForTerminalInputTests();
+  let chooseCount = 0;
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise(() => {});
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  void commands[0].options.handler("", ctx);
+  assert.equal(chooseCount, 1);
+
+  handlers.get("session_shutdown")({}, ctx);
+  handlers.get("session_start")({}, ctx);
+  const terminalResult = listeners.at(-1)("\x1b\x03");
+  await waitForMicrotasks();
+
+  assert.deepEqual(terminalResult, { consume: true });
+  assert.equal(chooseCount, 2);
+});
+
+test("stale session completion cannot clear the active session guard", async () => {
+  const { handlers, listeners, cleanupCalls, commands } = registerForTerminalInputTests();
+  let chooseCount = 0;
+  const finishChoosing = [];
+  const ctx = createTerminalInputContext({
+    listeners,
+    cleanupCalls,
+    markdown: ["```js", "console.log('one')", "```", "", "```js", "console.log('two')", "```"].join("\n"),
+    custom() {
+      chooseCount += 1;
+      return new Promise((resolve) => {
+        finishChoosing.push(() => resolve(undefined));
+      });
+    },
+  });
+
+  handlers.get("session_start")({}, ctx);
+  void commands[0].options.handler("", ctx);
+  assert.equal(chooseCount, 1);
+
+  handlers.get("session_shutdown")({}, ctx);
+  handlers.get("session_start")({}, ctx);
+  const currentListener = listeners.at(-1);
+  currentListener("\x1b\x03");
+  assert.equal(chooseCount, 2);
+
+  finishChoosing[0]();
+  await waitForMicrotasks();
+  currentListener("\x1b\x03");
+  assert.equal(chooseCount, 2, "the stale run must not release the current session guard");
+
+  finishChoosing[1]();
+  await waitForMicrotasks();
+  currentListener("\x1b\x03");
+  assert.equal(chooseCount, 3);
+
+  finishChoosing[2]();
+  await waitForMicrotasks();
+});
+
+function registerForTerminalInputTests() {
+  const handlers = new Map();
+  const listeners = [];
+  const cleanupCalls = [];
+  const commands = [];
+  const shortcuts = [];
+
+  extension.default({
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+    registerCommand(name, options) {
+      commands.push({ name, options });
+    },
+    registerShortcut(shortcut, options) {
+      shortcuts.push({ shortcut, options });
+    },
+  });
+
+  return { handlers, listeners, cleanupCalls, commands, shortcuts };
+}
+
+function createTerminalInputContext({
+  listeners,
+  cleanupCalls,
+  notifications = [],
+  markdown,
+  custom = () => Promise.resolve(undefined),
+}) {
+  return {
+    hasUI: true,
+    isIdle: () => true,
+    ui: {
+      notify(message, type) {
+        notifications.push({ message, type });
+      },
+      onTerminalInput(handler) {
+        const index = listeners.push(handler) - 1;
+        return () => cleanupCalls.push(index);
+      },
+      custom,
+    },
+    sessionManager: {
+      getEntries: () =>
+        markdown
+          ? [
+              {
+                type: "message",
+                message: { role: "assistant", content: [{ type: "text", text: markdown }] },
+              },
+            ]
+          : [],
+    },
+  };
+}
+
+async function waitForMicrotasks() {
+  await new Promise((resolve) => setImmediate(resolve));
+}
