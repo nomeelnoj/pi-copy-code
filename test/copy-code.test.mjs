@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
 
@@ -35,6 +38,27 @@ test("extractCodeBlocks preserves whitespace and language", () => {
       lang: "python",
       code: "def hello():\n    return \"world\"",
     },
+  ]);
+});
+
+test("extractCodeBlocks strips structural indentation from sibling backtick and tilde fences", () => {
+  const markdown = [
+    "  ```ts",
+    "  const top = true;",
+    "    const nested = true;",
+    " x",
+    "",
+    " \t",
+    "     ```",
+    "\t~~~sh",
+    "\techo tab",
+    "  echo spaces",
+    "~~~",
+  ].join("\n");
+
+  assert.deepEqual(extension.extractCodeBlocks(markdown), [
+    { index: 1, lang: "ts", code: "const top = true;\n  const nested = true;\nx\n\n \t" },
+    { index: 2, lang: "sh", code: "echo tab\n echo spaces" },
   ]);
 });
 
@@ -213,6 +237,388 @@ test("splitEditorCommand preserves quoted editor commands", () => {
   assert.deepEqual(extension.splitEditorCommand('"C:\\Program Files\\Neovim\\bin\\nvim.exe"'), [
     "C:\\Program Files\\Neovim\\bin\\nvim.exe",
   ]);
+});
+
+test("buildEditorSpawn uses direct argv on POSIX and for native Windows executables", () => {
+  assert.deepEqual(
+    extension.buildEditorSpawn('nvim --cmd "set background=dark"', "/tmp/code & notes.txt", "linux"),
+    { command: "nvim", args: ["--cmd", "set background=dark", "/tmp/code & notes.txt"], options: {} },
+  );
+  assert.deepEqual(
+    extension.buildEditorSpawn('"C:\\Tools\\edit.exe" --wait', "C:\\Temp\\code & notes.txt", "win32"),
+    {
+      command: "C:\\Tools\\edit.exe",
+      args: ["--wait", "C:\\Temp\\code & notes.txt"],
+      options: {},
+    },
+  );
+  assert.deepEqual(
+    extension.buildEditorSpawn('"C:\\Tools\\edit.com"', "C:\\Temp\\code.txt", "win32"),
+    { command: "C:\\Tools\\edit.com", args: ["C:\\Temp\\code.txt"], options: {} },
+  );
+});
+
+test("buildEditorSpawn safely wraps Windows shims and extension-less commands in one cmd command string", () => {
+  assert.deepEqual(
+    extension.buildEditorSpawn(
+      '"C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd" --wait --reuse-window',
+      "C:\\Temp Files\\code & notes (1) ^ done.txt",
+      "win32",
+      "C:\\Windows\\System32\\cmd.exe",
+    ),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/c",
+        '"C:\\Program^ Files\\Microsoft^ VS^ Code\\bin\\code.cmd ^"--wait^" ^"--reuse-window^" ^"C:\\Temp^ Files\\code^ ^&^ notes^ ^(1^)^ ^^^ done.txt^""',
+      ],
+      options: { windowsVerbatimArguments: true },
+    },
+  );
+  assert.deepEqual(
+    extension.buildEditorSpawn("code --wait", "C:\\Temp\\code.txt", "win32"),
+    {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", '"code ^"--wait^" ^"C:\\Temp\\code.txt^""'],
+      options: { windowsVerbatimArguments: true },
+    },
+  );
+  assert.deepEqual(
+    extension.buildEditorSpawn("nvim", "C:\\Temp\\code.txt", "win32"),
+    {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", '"nvim ^"C:\\Temp\\code.txt^""'],
+      options: { windowsVerbatimArguments: true },
+    },
+  );
+});
+
+test("resolveEditorCommand falls through an empty VISUAL while injected commands retain precedence", () => {
+  assert.equal(extension.resolveEditorCommand(undefined, { VISUAL: "", EDITOR: "nvim" }), "nvim");
+  assert.equal(extension.resolveEditorCommand("code --wait", { VISUAL: "vim", EDITOR: "nvim" }), "code --wait");
+  assert.equal(extension.resolveEditorCommand("", { VISUAL: "vim", EDITOR: "nvim" }), "");
+});
+
+test("picker Ctrl+C cancels both normal and search modes", () => {
+  for (const enterSearch of [false, true]) {
+    const results = [];
+    const picker = new extension.CodeBlockPickerComponent(
+      [{ ordinal: 1, blocks: [{ index: 1, lang: "js", code: "one" }, { index: 2, lang: "js", code: "two" }] }],
+      {},
+      {},
+      { requestRender() {} },
+      "copy",
+      (result) => results.push(result),
+    );
+    if (enterSearch) picker.handleInput("/");
+    picker.handleInput("\x03");
+    assert.deepEqual(results, [undefined]);
+  }
+});
+
+test("external editor uses private storage, edits, and cleans up without following a predictable symlink", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const victim = path.join(root, "victim.txt");
+  const predictable = path.join(root, "pi-copy-code.txt");
+  const editorScript = path.join(root, "editor.mjs");
+  fs.writeFileSync(victim, "do not overwrite");
+  fs.symlinkSync(victim, predictable);
+  fs.writeFileSync(editorScript, "import fs from 'node:fs'; fs.appendFileSync(process.argv.at(-1), '\\nedited\\n');");
+  const tuiCalls = [];
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    {
+      stop() { tuiCalls.push("stop"); },
+      start() { tuiCalls.push("start"); },
+      requestRender(full) { tuiCalls.push(["render", full]); },
+    },
+    (result) => results.push(result),
+    { editorCommand: `"${process.execPath}" "${editorScript}"`, tempRoot: root },
+  );
+
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.deepEqual(results, [{ code: "original\nedited" }]);
+  assert.deepEqual(tuiCalls, ["stop", "start", ["render", true]]);
+  assert.equal(fs.readFileSync(victim, "utf8"), "do not overwrite");
+  assert.deepEqual(fs.readdirSync(root).sort(), ["editor.mjs", "pi-copy-code.txt", "victim.txt"]);
+});
+
+test("external editor removes a final CRLF from edited code", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const editorScript = path.join(root, "editor.mjs");
+  fs.writeFileSync(editorScript, "import fs from 'node:fs'; fs.writeFileSync(process.argv.at(-1), 'edited\\r\\n');");
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    { stop() {}, start() {}, requestRender() {} },
+    (result) => results.push(result),
+    { editorCommand: `"${process.execPath}" "${editorScript}"`, tempRoot: root },
+  );
+
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.deepEqual(results, [{ code: "edited" }]);
+});
+
+test("external editor spawn failure completes once, restores the TUI, and cleans up", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const tuiCalls = [];
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    {
+      stop() { tuiCalls.push("stop"); },
+      start() { tuiCalls.push("start"); },
+      requestRender(full) { tuiCalls.push(["render", full]); },
+    },
+    (result) => results.push(result),
+    { editorCommand: path.join(root, "missing-editor"), tempRoot: root },
+  );
+
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.equal(results.length, 1);
+  assert.match(results[0].error, /^Unable to start editor:/);
+  assert.deepEqual(tuiCalls, ["stop", "start", ["render", true]]);
+  assert.deepEqual(fs.readdirSync(root), []);
+});
+
+test("external editor reports a missing editor without stopping the TUI", async () => {
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    { stop() { throw new Error("must not stop"); } },
+    (result) => results.push(result),
+    { editorCommand: "" },
+  );
+
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.deepEqual(results, [{ error: "No external editor configured. Set $VISUAL or $EDITOR." }]);
+});
+
+test("external editor reports a nonzero editor status and restores the TUI", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const editorScript = path.join(root, "editor.mjs");
+  fs.writeFileSync(editorScript, "process.exit(7);");
+  const tuiCalls = [];
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    {
+      stop() { tuiCalls.push("stop"); },
+      start() { tuiCalls.push("start"); },
+      requestRender(full) { tuiCalls.push(["render", full]); },
+    },
+    (result) => results.push(result),
+    { editorCommand: `"${process.execPath}" "${editorScript}"`, tempRoot: root },
+  );
+
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.deepEqual(results, [{ error: "Editor exited with status 7" }]);
+  assert.deepEqual(tuiCalls, ["stop", "start", ["render", true]]);
+});
+
+test("external editor preserves edited code when temporary cleanup fails", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const editorScript = path.join(root, "editor.mjs");
+  fs.writeFileSync(editorScript, "// leave the file unchanged\n");
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    { stop() {}, start() {}, requestRender() {} },
+    (result) => results.push(result),
+    {
+      editorCommand: `"${process.execPath}" "${editorScript}"`,
+      tempRoot: root,
+      removeTemp() { throw new Error("cleanup denied"); },
+    },
+  );
+
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.deepEqual(results, [{ code: "original", warnings: ["Unable to remove editor files: cleanup denied"] }]);
+});
+
+test("external editor preserves edited code when TUI restoration fails", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const editorScript = path.join(root, "editor.mjs");
+  fs.writeFileSync(editorScript, "// leave the file unchanged\n");
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    {
+      stop() {},
+      start() { throw new Error("terminal unavailable"); },
+      requestRender() { throw new Error("must not render after failed start"); },
+    },
+    (result) => results.push(result),
+    { editorCommand: `"${process.execPath}" "${editorScript}"`, tempRoot: root },
+  );
+
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.deepEqual(results, [{ code: "original", warnings: ["Unable to restore terminal UI: terminal unavailable"] }]);
+  assert.deepEqual(fs.readdirSync(root), ["editor.mjs"]);
+});
+
+test("external editor setup failure completes once without restarting the TUI", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  fs.rmSync(root, { recursive: true });
+  const tuiCalls = [];
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    {
+      stop() { tuiCalls.push("stop"); },
+      start() { tuiCalls.push("start"); },
+      requestRender(full) { tuiCalls.push(["render", full]); },
+    },
+    (result) => results.push(result),
+    { editorCommand: "nvim", tempRoot: root },
+  );
+
+  component.render(80);
+  component.render(80);
+  await waitUntil(() => results.length === 1);
+
+  assert.equal(results.length, 1);
+  assert.match(results[0].error, /^Unable to prepare editor file:/);
+  assert.deepEqual(tuiCalls, []);
+});
+
+test("external editor Ctrl+C cancels exactly once before process handoff", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-copy-code-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const results = [];
+  const component = new extension.ExternalEditorComponent(
+    "original",
+    { stop() {}, start() {}, requestRender() {} },
+    (result) => results.push(result),
+    { editorCommand: "nvim", tempRoot: root },
+  );
+
+  component.render(80);
+  component.handleInput("\x03");
+  component.handleInput("\x03");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.deepEqual(results, [undefined]);
+  assert.deepEqual(fs.readdirSync(root), []);
+});
+
+test("edit errors preserve cleanup warnings before reporting failure", async () => {
+  const harness = registerForClipboardTests({ nativeCommand: "pbcopy" });
+  const context = createClipboardContext(harness);
+  context.ui.custom = () =>
+    Promise.resolve({
+      error: "Editor exited with status 7",
+      warnings: ["Unable to remove editor files: cleanup denied"],
+    });
+
+  await harness.commands[0].options.handler("edit", context);
+
+  assert.deepEqual(harness.notifications, [
+    { message: "Copy warning: Unable to remove editor files: cleanup denied", type: "warning" },
+    { message: "Copy failed: Editor exited with status 7", type: "error" },
+  ]);
+});
+
+test("native and OSC 52 clipboard outcomes have accurate messages and rendering", async () => {
+  const native = registerForClipboardTests({ nativeCommand: "pbcopy" });
+  await native.commands[0].options.handler("", createClipboardContext(native));
+  assert.deepEqual(native.notifications, [{ message: "Copied 1 line via pbcopy", type: "info" }]);
+
+  const osc52 = registerForClipboardTests({ nativeCommand: null, isTTY: true });
+  await osc52.commands[0].options.handler("", createClipboardContext(osc52));
+  assert.deepEqual(osc52.notifications, [
+    { message: "Sent 1 line to terminal clipboard via OSC 52 (best effort)", type: "info" },
+  ]);
+  assert.deepEqual(osc52.renderCalls, [true]);
+  assert.match(osc52.writes.join(""), /^\x1b\]52;c;/);
+});
+
+test("production OSC 52 render path forces a real TUI render without awaiting the overlay", async () => {
+  const harness = registerForClipboardTests({ nativeCommand: null, isTTY: true, useProductionRender: true });
+  const context = createClipboardContext(harness);
+  context.ui.custom = (factory, options) => {
+    assert.deepEqual(options, { overlay: true });
+    factory(
+      { requestRender(force) { harness.renderCalls.push(force); } },
+      {},
+      {},
+      () => harness.doneCalls.push(true),
+    );
+    return new Promise(() => {});
+  };
+
+  await Promise.race([
+    harness.commands[0].options.handler("", context),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("copy command hung on render overlay")), 100)),
+  ]);
+
+  assert.deepEqual(harness.renderCalls, [true]);
+  assert.deepEqual(harness.doneCalls, [true]);
+  assert.deepEqual(harness.notifications, [
+    { message: "Sent 1 line to terminal clipboard via OSC 52 (best effort)", type: "info" },
+  ]);
+});
+
+test("OSC 52 render failure does not invert a successful clipboard send", async () => {
+  const harness = registerForClipboardTests({ nativeCommand: null, isTTY: true, useProductionRender: true });
+  const context = createClipboardContext(harness);
+  context.ui.custom = (factory) => {
+    factory({ requestRender() { throw new Error("render failed"); } }, {}, {}, () => {});
+    return Promise.reject(new Error("overlay failed"));
+  };
+
+  await harness.commands[0].options.handler("", context);
+
+  assert.equal(harness.writes.length, 1);
+  assert.deepEqual(harness.notifications, [
+    { message: "Sent 1 line to terminal clipboard via OSC 52 (best effort)", type: "info" },
+  ]);
+});
+
+test("OSC 52 rejects oversized TTY payloads without writing", async () => {
+  const harness = registerForClipboardTests({ nativeCommand: null, isTTY: true });
+  const context = createClipboardContext(harness);
+  context.sessionManager.getEntries = () => [assistantEntry(`\`\`\`text\n${"x".repeat(75_001)}\n\`\`\``)];
+
+  await harness.commands[0].options.handler("", context);
+
+  assert.deepEqual(harness.writes, []);
+  assert.deepEqual(harness.notifications, [
+    { message: "Copy failed: Clipboard unavailable: OSC 52 payload is too large", type: "error" },
+  ]);
+});
+
+test("clipboard fallback reports terminal unavailable without a TTY", async () => {
+  const harness = registerForClipboardTests({ nativeCommand: null, isTTY: false });
+  await harness.commands[0].options.handler("", createClipboardContext(harness));
+  assert.deepEqual(harness.notifications, [
+    { message: "Copy failed: Clipboard unavailable: no native command found and terminal clipboard is not available", type: "error" },
+  ]);
+  assert.deepEqual(harness.renderCalls, []);
+  assert.deepEqual(harness.writes, []);
 });
 
 test("extension registers /copy-code with native and remapped shortcuts", () => {
@@ -515,6 +921,34 @@ test("stale session completion cannot clear the active session guard", async () 
   await waitForMicrotasks();
 });
 
+function registerForClipboardTests({ nativeCommand, isTTY = false, useProductionRender = false }) {
+  const commands = [];
+  const harness = { commands, notifications: [], renderCalls: [], doneCalls: [], writes: [] };
+  const runtime = {
+    copyNative: () => nativeCommand,
+    stdout: { isTTY, write(data) { harness.writes.push(data); return true; } },
+  };
+  if (!useProductionRender) {
+    runtime.requestFullRender = () => harness.renderCalls.push(true);
+  }
+  extension.default(
+    {
+      on() {},
+      registerCommand(name, options) { commands.push({ name, options }); },
+      registerShortcut() {},
+    },
+    runtime,
+  );
+  return harness;
+}
+
+function createClipboardContext(harness) {
+  return {
+    ui: { notify(message, type) { harness.notifications.push({ message, type }); } },
+    sessionManager: { getEntries: () => [assistantEntry("```js\none\n```")] },
+  };
+}
+
 function registerForTerminalInputTests() {
   const handlers = new Map();
   const listeners = [];
@@ -573,4 +1007,12 @@ function createTerminalInputContext({
 
 async function waitForMicrotasks() {
   await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function waitUntil(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }

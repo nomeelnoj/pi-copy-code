@@ -1,23 +1,70 @@
 name: Publish to npm
 
 on:
-  push:
-    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to validate (for example, v0.3.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  publish:
+  validate-release:
+    name: validate-release
     runs-on: ubuntu-latest
+    steps:
+      - name: Check out commit to validate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24"
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: |
+          node <<'NODE'
+          const expected = `v${require("./package.json").version}`;
+          if (process.env.RELEASE_TAG !== expected) {
+            console.error(`Release tag ${process.env.RELEASE_TAG} does not match ${expected}`);
+            process.exit(1);
+          }
+          NODE
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - name: Exercise npm publish without a registry write
+        if: github.event_name == 'workflow_dispatch'
+        run: npm publish --dry-run
+
+  publish:
+    name: publish
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: validate-release
+    runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - name: Check out validated commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-      - run: npm ci
-      - run: npm test
-      - uses: JS-DevTools/npm-publish@v4
-        with:
-          access: public
+          registry-url: https://registry.npmjs.org
+      - name: Publish package
+        run: npm publish --provenance
