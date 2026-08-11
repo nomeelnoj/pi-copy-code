@@ -4,10 +4,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { selectNpmInvocation } from "./npm-invocation.mjs";
+import { assertMinimumNpmVersion, selectNpmInvocation } from "./npm-invocation.mjs";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const packageJson = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+const pinnedPeerPackages = Object.keys(packageJson.peerDependencies).map((name) => {
+  const version = packageJson.devDependencies[name];
+  assert.equal(typeof version, "string", `${name} must have a pinned development baseline`);
+  return `${name}@${version}`;
+});
 const jitiModuleUrl = import.meta.resolve("jiti");
 const npmInvocation = selectNpmInvocation({
   platform: process.platform,
@@ -15,8 +20,10 @@ const npmInvocation = selectNpmInvocation({
   nodeExecPath: process.execPath,
   npmRunCommand: "npm run smoke-package",
 });
-const temporaryRoot = mkdtempSync(path.join(tmpdir(), "pi-copy-code-smoke-"));
 const npmArguments = (arguments_) => [...npmInvocation.prefixArguments, ...arguments_];
+const npmVersion = execFileSync(npmInvocation.command, npmArguments(["--version"]), { encoding: "utf8" }).trim();
+assertMinimumNpmVersion(npmVersion, "11.10.0");
+const temporaryRoot = mkdtempSync(path.join(tmpdir(), "pi-copy-code-smoke-"));
 
 try {
   const packOutput = execFileSync(
@@ -42,9 +49,11 @@ try {
       "install",
       "--ignore-scripts",
       "--omit=dev",
+      "--min-release-age=0",
       "--prefix",
       installRoot,
       path.join(temporaryRoot, filename),
+      ...pinnedPeerPackages,
     ]),
     { cwd: temporaryRoot, stdio: "pipe" },
   );
@@ -56,6 +65,12 @@ try {
   const installedPackageRoot = path.join(installRoot, "node_modules", ...packageJson.name.split("/"));
   const extensionPath = path.join(installedPackageRoot, packageJson.pi.extensions[0]);
   assert.equal(existsSync(path.join(installRoot, "node_modules", "jiti")), false, "clean install must omit jiti");
+  for (const name of Object.keys(packageJson.peerDependencies)) {
+    const installedPackage = JSON.parse(
+      readFileSync(path.join(installRoot, "node_modules", ...name.split("/"), "package.json"), "utf8"),
+    );
+    assert.equal(installedPackage.version, packageJson.devDependencies[name], `${name} must use the pinned baseline`);
+  }
   const harness = `
     import assert from "node:assert/strict";
     import { createJiti } from ${JSON.stringify(jitiModuleUrl)};
